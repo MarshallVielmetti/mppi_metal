@@ -18,7 +18,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(METAL_STD macos-metal2.3)
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
 
-# Library metallib (mppi_rollout kernel)
+# Library metallib (mppi_rollout + mppi_reduce kernels)
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mppi_rollout.air
     COMMAND xcrun metal -std=${METAL_STD} -c
@@ -29,11 +29,22 @@ add_custom_command(
     COMMENT "Compiling mppi_rollout.metal"
 )
 add_custom_command(
+    OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mppi_reduce.air
+    COMMAND xcrun metal -std=${METAL_STD} -c
+            ${SHADER_DIR}/mppi_reduce.metal
+            -I ${SHADER_DIR}
+            -o ${CMAKE_CURRENT_BINARY_DIR}/mppi_reduce.air
+    DEPENDS ${SHADER_DIR}/mppi_reduce.metal ${SHADER_DIR}/mppi_core.h ${SHADER_DIR}/philox.h
+    COMMENT "Compiling mppi_reduce.metal"
+)
+add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mppi_rollout.metallib
     COMMAND xcrun metallib
             ${CMAKE_CURRENT_BINARY_DIR}/mppi_rollout.air
+            ${CMAKE_CURRENT_BINARY_DIR}/mppi_reduce.air
             -o ${CMAKE_CURRENT_BINARY_DIR}/mppi_rollout.metallib
     DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mppi_rollout.air
+            ${CMAKE_CURRENT_BINARY_DIR}/mppi_reduce.air
     COMMENT "Linking mppi_rollout.metallib"
 )
 add_custom_target(mppi_rollout_metallib DEPENDS

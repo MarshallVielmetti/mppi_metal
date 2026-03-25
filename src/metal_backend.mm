@@ -38,15 +38,22 @@ std::string to_std_string(NSString *str) {
 struct MetalBackend::Impl {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> command_queue = nil;
-  id<MTLComputePipelineState> pipeline = nil;
-  id<MTLLibrary> library_metallib = nil;
-  id<MTLLibrary> user_metallib = nil;
+
+  // Pass 1: rollout pipeline (linked with user callables).
+  id<MTLComputePipelineState> rollout_pipeline = nil;
   id<MTLVisibleFunctionTable> dynamics_table = nil;
   id<MTLVisibleFunctionTable> stage_cost_table = nil;
   id<MTLVisibleFunctionTable> terminal_cost_table = nil;
+
+  // Pass 2: reduction pipeline (no linked functions needed).
+  id<MTLComputePipelineState> reduce_pipeline = nil;
+
+  id<MTLLibrary> library_metallib = nil;
+  id<MTLLibrary> user_metallib = nil;
   id<MTLBuffer> model_params_buffer = nil;
   id<MTLBuffer> cost_params_buffer = nil;
-  NSUInteger max_threads_per_threadgroup = 0;
+  NSUInteger rollout_max_tpg = 0;
+  NSUInteger reduce_max_tpg = 0;
   uint32_t rng_seed = 0;
   bool initialized = false;
 };
@@ -56,11 +63,8 @@ struct MetalBackend::Impl {
 // ---------------------------------------------------------------------------
 
 MetalBackend::MetalBackend() : impl_(std::make_unique<Impl>()) {}
-
 MetalBackend::~MetalBackend() = default;
-
 MetalBackend::MetalBackend(MetalBackend &&) noexcept = default;
-
 MetalBackend &MetalBackend::operator=(MetalBackend &&) noexcept = default;
 
 // ---------------------------------------------------------------------------
@@ -76,37 +80,46 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
   }
 
   NSString *lib_path = [NSString stringWithUTF8String:MPPI_ROLLOUT_METALLIB_PATH];
-  NSError *lib_error = nil;
+  NSError *ns_err = nil;
   impl_->library_metallib =
       [impl_->device newLibraryWithURL:[NSURL fileURLWithPath:lib_path]
-                                 error:&lib_error];
+                                 error:&ns_err];
   if (impl_->library_metallib == nil) {
     set_error(error, "Failed to load library metallib: " +
-              to_std_string(lib_error.localizedDescription));
+              to_std_string(ns_err.localizedDescription));
     return false;
   }
 
-  id<MTLFunction> kernel_fn =
+  // ---- Rollout kernel (Pass 1) ----
+  id<MTLFunction> rollout_fn =
       [impl_->library_metallib newFunctionWithName:@"mppi_rollout"];
-  if (kernel_fn == nil) {
+  if (rollout_fn == nil) {
     set_error(error, "Required library symbol 'mppi_rollout' missing.");
     return false;
   }
 
+  // ---- Reduce kernel (Pass 2) ----
+  id<MTLFunction> reduce_fn =
+      [impl_->library_metallib newFunctionWithName:@"mppi_reduce"];
+  if (reduce_fn == nil) {
+    set_error(error, "Required library symbol 'mppi_reduce' missing.");
+    return false;
+  }
+
+  // ---- Load user metallib ----
   std::string user_path_str = model.user_metallib_path.string();
   if (user_path_str.empty()) {
     set_error(error, "user_metallib_path is empty.");
     return false;
   }
-  NSError *user_error = nil;
   impl_->user_metallib =
       [impl_->device newLibraryWithURL:
           [NSURL fileURLWithPath:
               [NSString stringWithUTF8String:user_path_str.c_str()]]
-                                 error:&user_error];
+                                 error:&ns_err];
   if (impl_->user_metallib == nil) {
     set_error(error, "Failed to load user metallib '" + user_path_str +
-              "': " + to_std_string(user_error.localizedDescription));
+              "': " + to_std_string(ns_err.localizedDescription));
     return false;
   }
 
@@ -151,37 +164,45 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
         newFunctionWithName:@"mppi_default_terminal_cost"];
   }
 
-  // Link all three callables.
+  // ---- Build rollout pipeline (linked with user callables) ----
   MTLLinkedFunctions *linked = [[MTLLinkedFunctions alloc] init];
   linked.functions = @[dynamics_fn, stage_cost_fn, terminal_cost_fn];
 
-  MTLComputePipelineDescriptor *pipe_desc =
+  MTLComputePipelineDescriptor *rollout_desc =
       [[MTLComputePipelineDescriptor alloc] init];
-  pipe_desc.computeFunction = kernel_fn;
-  pipe_desc.linkedFunctions = linked;
+  rollout_desc.computeFunction = rollout_fn;
+  rollout_desc.linkedFunctions = linked;
 
-  NSError *pipeline_error = nil;
-  impl_->pipeline =
-      [impl_->device newComputePipelineStateWithDescriptor:pipe_desc
+  impl_->rollout_pipeline =
+      [impl_->device newComputePipelineStateWithDescriptor:rollout_desc
                                                   options:0
                                                reflection:nil
-                                                    error:&pipeline_error];
-  if (impl_->pipeline == nil) {
-    set_error(error, "Failed to create linked compute pipeline: " +
-              to_std_string(pipeline_error.localizedDescription));
+                                                    error:&ns_err];
+  if (impl_->rollout_pipeline == nil) {
+    set_error(error, "Failed to create rollout pipeline: " +
+              to_std_string(ns_err.localizedDescription));
     return false;
   }
 
-  // Create visible function tables (1 entry each).
+  // ---- Build reduce pipeline (no linked functions) ----
+  impl_->reduce_pipeline =
+      [impl_->device newComputePipelineStateWithFunction:reduce_fn error:&ns_err];
+  if (impl_->reduce_pipeline == nil) {
+    set_error(error, "Failed to create reduce pipeline: " +
+              to_std_string(ns_err.localizedDescription));
+    return false;
+  }
+
+  // ---- Visible function tables (1 entry each) ----
   auto make_table = [&](id<MTLFunction> fn) -> id<MTLVisibleFunctionTable> {
     MTLVisibleFunctionTableDescriptor *td =
         [[MTLVisibleFunctionTableDescriptor alloc] init];
     td.functionCount = 1;
     id<MTLVisibleFunctionTable> table =
-        [impl_->pipeline newVisibleFunctionTableWithDescriptor:td];
+        [impl_->rollout_pipeline newVisibleFunctionTableWithDescriptor:td];
     if (table != nil) {
       id<MTLFunctionHandle> handle =
-          [impl_->pipeline functionHandleWithFunction:fn];
+          [impl_->rollout_pipeline functionHandleWithFunction:fn];
       if (handle != nil) [table setFunction:handle atIndex:0];
     }
     return table;
@@ -203,8 +224,10 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
     return false;
   }
 
-  impl_->max_threads_per_threadgroup =
-      impl_->pipeline.maxTotalThreadsPerThreadgroup;
+  impl_->rollout_max_tpg =
+      impl_->rollout_pipeline.maxTotalThreadsPerThreadgroup;
+  impl_->reduce_max_tpg =
+      impl_->reduce_pipeline.maxTotalThreadsPerThreadgroup;
   impl_->rng_seed = static_cast<uint32_t>(model.rng.seed);
   impl_->initialized = true;
   return true;
@@ -241,7 +264,7 @@ bool MetalBackend::bind_params(const ByteView &model_params,
 }
 
 // ---------------------------------------------------------------------------
-// dispatch_rollout
+// dispatch_rollout  (two-pass: rollout → reduce)
 // ---------------------------------------------------------------------------
 
 bool MetalBackend::dispatch_rollout(const DriverConfig &config,
@@ -262,24 +285,39 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   const uint32_t sdim = config.state_dim;
   const uint32_t cdim = config.control_dim;
   const size_t seq_len = static_cast<size_t>(H) * cdim;
-  const size_t total_noise = static_cast<size_t>(S) * seq_len;
 
-  // ---- GPU buffers ----
-  id<MTLBuffer> x0_buf =
-      [impl_->device newBufferWithBytes:x0
-                                length:sdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
+  // ---- Shared buffers (used by both passes) ----
   id<MTLBuffer> u_nom_buf =
       [impl_->device newBufferWithBytes:u_nominal
                                 length:seq_len * sizeof(float)
                                options:MTLResourceStorageModeShared];
+  id<MTLBuffer> sigma_buf =
+      [impl_->device newBufferWithBytes:noise.sigma
+                                length:cdim * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+  id<MTLBuffer> umin_buf =
+      [impl_->device newBufferWithBytes:config.bounds.u_min
+                                length:cdim * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+  id<MTLBuffer> umax_buf =
+      [impl_->device newBufferWithBytes:config.bounds.u_max
+                                length:cdim * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+  uint32_t seed = impl_->rng_seed;
+  id<MTLBuffer> seed_buf =
+      [impl_->device newBufferWithBytes:&seed length:sizeof(uint32_t)
+                               options:MTLResourceStorageModeShared];
+  uint32_t step_idx32 = static_cast<uint32_t>(step_index);
+  id<MTLBuffer> step_buf =
+      [impl_->device newBufferWithBytes:&step_idx32 length:sizeof(uint32_t)
+                               options:MTLResourceStorageModeShared];
 
-  // Noise output buffer (kernel writes, host reads back for MPPI update).
-  id<MTLBuffer> noise_buf =
-      [impl_->device newBufferWithLength:total_noise * sizeof(float)
-                                options:MTLResourceStorageModeShared];
+  // ---- Pass 1: Rollout ----
+  id<MTLBuffer> x0_buf =
+      [impl_->device newBufferWithBytes:x0
+                                length:sdim * sizeof(float)
+                               options:MTLResourceStorageModeShared];
 
-  // Param buffers.
   auto resolve_param_buf = [&](const ByteView &bv,
                                id<MTLBuffer> bound) -> id<MTLBuffer> {
     if (bv.bytes > 0 && bv.data != nullptr)
@@ -297,23 +335,7 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
       [impl_->device newBufferWithLength:S * sizeof(float)
                                 options:MTLResourceStorageModeShared];
 
-  // Bounds.
-  id<MTLBuffer> umin_buf =
-      [impl_->device newBufferWithBytes:config.bounds.u_min
-                                length:cdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> umax_buf =
-      [impl_->device newBufferWithBytes:config.bounds.u_max
-                                length:cdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
-
-  // Sigma (noise covariance diagonal).
-  id<MTLBuffer> sigma_buf =
-      [impl_->device newBufferWithBytes:noise.sigma
-                                length:cdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
-
-  // Scalar constants.
+  // Scalar constant buffers.
   id<MTLBuffer> sdim_buf =
       [impl_->device newBufferWithBytes:&sdim length:sizeof(uint32_t)
                                options:MTLResourceStorageModeShared];
@@ -326,63 +348,54 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   id<MTLBuffer> sample_buf =
       [impl_->device newBufferWithBytes:&S length:sizeof(uint32_t)
                                options:MTLResourceStorageModeShared];
-  uint32_t seed = impl_->rng_seed;
-  id<MTLBuffer> seed_buf =
-      [impl_->device newBufferWithBytes:&seed length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-  uint32_t step_idx32 = static_cast<uint32_t>(step_index);
-  id<MTLBuffer> step_buf =
-      [impl_->device newBufferWithBytes:&step_idx32 length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
 
-  // ---- Encode and dispatch ----
   id<MTLCommandBuffer> cmd_buf = [impl_->command_queue commandBuffer];
-  id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
 
-  [enc setComputePipelineState:impl_->pipeline];
-  [enc setBuffer:x0_buf      offset:0 atIndex:0];
-  [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
-  [enc setBuffer:noise_buf   offset:0 atIndex:2];
-  [enc setBuffer:mp_buf      offset:0 atIndex:3];
-  [enc setBuffer:cp_buf      offset:0 atIndex:4];
-  [enc setBuffer:costs_buf   offset:0 atIndex:5];
-  [enc setBuffer:sdim_buf    offset:0 atIndex:6];
-  [enc setBuffer:cdim_buf    offset:0 atIndex:7];
-  [enc setBuffer:horizon_buf offset:0 atIndex:8];
-  [enc setBuffer:sample_buf  offset:0 atIndex:9];
-  [enc setBuffer:umin_buf    offset:0 atIndex:10];
-  [enc setBuffer:umax_buf    offset:0 atIndex:11];
-  [enc setVisibleFunctionTable:impl_->dynamics_table      atBufferIndex:12];
-  [enc setVisibleFunctionTable:impl_->stage_cost_table    atBufferIndex:13];
-  [enc setVisibleFunctionTable:impl_->terminal_cost_table atBufferIndex:14];
-  [enc setBuffer:sigma_buf   offset:0 atIndex:15];
-  [enc setBuffer:seed_buf    offset:0 atIndex:16];
-  [enc setBuffer:step_buf    offset:0 atIndex:17];
+  // Encode rollout.
+  {
+    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+    [enc setComputePipelineState:impl_->rollout_pipeline];
+    [enc setBuffer:x0_buf      offset:0 atIndex:0];
+    [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
+    [enc setBuffer:mp_buf      offset:0 atIndex:2];
+    [enc setBuffer:cp_buf      offset:0 atIndex:3];
+    [enc setBuffer:costs_buf   offset:0 atIndex:4];
+    [enc setBuffer:sdim_buf    offset:0 atIndex:5];
+    [enc setBuffer:cdim_buf    offset:0 atIndex:6];
+    [enc setBuffer:horizon_buf offset:0 atIndex:7];
+    [enc setBuffer:sample_buf  offset:0 atIndex:8];
+    [enc setBuffer:umin_buf    offset:0 atIndex:9];
+    [enc setBuffer:umax_buf    offset:0 atIndex:10];
+    [enc setVisibleFunctionTable:impl_->dynamics_table      atBufferIndex:11];
+    [enc setVisibleFunctionTable:impl_->stage_cost_table    atBufferIndex:12];
+    [enc setVisibleFunctionTable:impl_->terminal_cost_table atBufferIndex:13];
+    [enc setBuffer:sigma_buf   offset:0 atIndex:14];
+    [enc setBuffer:seed_buf    offset:0 atIndex:15];
+    [enc setBuffer:step_buf    offset:0 atIndex:16];
 
-  NSUInteger tpg = std::min<NSUInteger>(impl_->max_threads_per_threadgroup, 256);
-  [enc dispatchThreads:MTLSizeMake(S, 1, 1)
-      threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-  [enc endEncoding];
+    NSUInteger tpg = std::min<NSUInteger>(impl_->rollout_max_tpg, 256);
+    [enc dispatchThreads:MTLSizeMake(S, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+  }
 
+  // Submit pass 1 and wait (we need costs on CPU for weight computation).
   [cmd_buf commit];
   [cmd_buf waitUntilCompleted];
 
   if (cmd_buf.status == MTLCommandBufferStatusError) {
-    set_error(error, "Metal command buffer failed: " +
+    set_error(error, "Rollout kernel failed: " +
               to_std_string(cmd_buf.error.localizedDescription));
     return false;
   }
 
-  // ---- MPPI update on host ----
+  // ---- CPU: compute weights from costs ----
   const float *costs = static_cast<const float *>(costs_buf.contents);
-  const float *noise_host = static_cast<const float *>(noise_buf.contents);
 
-  // Min cost for numerical stability.
   float min_cost = costs[0];
   for (uint32_t k = 1; k < S; ++k)
     if (costs[k] < min_cost) min_cost = costs[k];
 
-  // Weights: w_k = exp(-(cost_k - min_cost) / lambda).
   const float inv_lambda = 1.0f / config.lambda;
   std::vector<float> weights(S);
   float weight_sum = 0.0f;
@@ -392,23 +405,7 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   }
   for (uint32_t k = 0; k < S; ++k) weights[k] /= weight_sum;
 
-  // Updated controls: u*_i = u_nominal_i + Σ_k w_k * noise_{k,i}.
-  for (size_t i = 0; i < seq_len; ++i) {
-    float wn = 0.0f;
-    for (uint32_t k = 0; k < S; ++k)
-      wn += weights[k] * noise_host[k * seq_len + i];
-    u_out[i] = u_nominal[i] + wn;
-  }
-
-  // Clamp to bounds.
-  for (uint32_t t = 0; t < H; ++t)
-    for (uint32_t d = 0; d < cdim; ++d) {
-      size_t idx = t * cdim + d;
-      u_out[idx] = std::max(config.bounds.u_min[d],
-                   std::min(config.bounds.u_max[d], u_out[idx]));
-    }
-
-  // Diagnostics.
+  // Diagnostics (computed from costs on CPU).
   if (diagnostics != nullptr) {
     diagnostics->best_cost = min_cost;
     float sum = 0.0f;
@@ -419,6 +416,49 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
     diagnostics->effective_sample_size = 1.0f / w2;
     diagnostics->converged = false;
   }
+
+  // ---- Pass 2: Reduce ----
+  id<MTLBuffer> weights_buf =
+      [impl_->device newBufferWithBytes:weights.data()
+                                length:S * sizeof(float)
+                               options:MTLResourceStorageModeShared];
+  id<MTLBuffer> u_out_buf =
+      [impl_->device newBufferWithLength:seq_len * sizeof(float)
+                                options:MTLResourceStorageModeShared];
+
+  id<MTLCommandBuffer> cmd_buf2 = [impl_->command_queue commandBuffer];
+  {
+    id<MTLComputeCommandEncoder> enc = [cmd_buf2 computeCommandEncoder];
+    [enc setComputePipelineState:impl_->reduce_pipeline];
+    [enc setBuffer:weights_buf offset:0 atIndex:0];
+    [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
+    [enc setBuffer:u_out_buf   offset:0 atIndex:2];
+    [enc setBuffer:sigma_buf   offset:0 atIndex:3];
+    [enc setBuffer:umin_buf    offset:0 atIndex:4];
+    [enc setBuffer:umax_buf    offset:0 atIndex:5];
+    [enc setBuffer:sample_buf  offset:0 atIndex:6];
+    [enc setBuffer:horizon_buf offset:0 atIndex:7];
+    [enc setBuffer:cdim_buf    offset:0 atIndex:8];
+    [enc setBuffer:seed_buf    offset:0 atIndex:9];
+    [enc setBuffer:step_buf    offset:0 atIndex:10];
+
+    NSUInteger tpg2 = std::min<NSUInteger>(impl_->reduce_max_tpg, 256);
+    [enc dispatchThreads:MTLSizeMake(seq_len, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tpg2, 1, 1)];
+    [enc endEncoding];
+  }
+
+  [cmd_buf2 commit];
+  [cmd_buf2 waitUntilCompleted];
+
+  if (cmd_buf2.status == MTLCommandBufferStatusError) {
+    set_error(error, "Reduce kernel failed: " +
+              to_std_string(cmd_buf2.error.localizedDescription));
+    return false;
+  }
+
+  // ---- Read back updated controls ----
+  std::memcpy(u_out, u_out_buf.contents, seq_len * sizeof(float));
 
   return true;
 }
