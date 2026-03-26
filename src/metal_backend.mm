@@ -45,8 +45,13 @@ struct MetalBackend::Impl {
   id<MTLVisibleFunctionTable> stage_cost_table = nil;
   id<MTLVisibleFunctionTable> terminal_cost_table = nil;
 
-  // Pass 2: reduction pipeline (no linked functions needed).
+  // Pass 2: weights pipeline.
+  id<MTLComputePipelineState> weights_pipeline = nil;
+
+  // Pass 3: reduction pipeline (no linked functions needed).
   id<MTLComputePipelineState> reduce_pipeline = nil;
+
+  id<MTLBuffer> diagnostics_buf = nil;
 
   id<MTLLibrary> library_metallib = nil;
   id<MTLLibrary> user_metallib = nil;
@@ -98,11 +103,19 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
     return false;
   }
 
-  // ---- Reduce kernel (Pass 2) ----
+  // ---- Reduce kernel (Pass 3) ----
   id<MTLFunction> reduce_fn =
       [impl_->library_metallib newFunctionWithName:@"mppi_reduce"];
   if (reduce_fn == nil) {
     set_error(error, "Required library symbol 'mppi_reduce' missing.");
+    return false;
+  }
+
+  // ---- Weights kernel (Pass 2) ----
+  id<MTLFunction> weights_fn =
+      [impl_->library_metallib newFunctionWithName:@"mppi_compute_weights"];
+  if (weights_fn == nil) {
+    set_error(error, "Required library symbol 'mppi_compute_weights' missing.");
     return false;
   }
 
@@ -184,6 +197,15 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
     return false;
   }
 
+  // ---- Build weights pipeline (no linked functions) ----
+  impl_->weights_pipeline =
+      [impl_->device newComputePipelineStateWithFunction:weights_fn error:&ns_err];
+  if (impl_->weights_pipeline == nil) {
+    set_error(error, "Failed to create weights pipeline: " +
+              to_std_string(ns_err.localizedDescription));
+    return false;
+  }
+
   // ---- Build reduce pipeline (no linked functions) ----
   impl_->reduce_pipeline =
       [impl_->device newComputePipelineStateWithFunction:reduce_fn error:&ns_err];
@@ -192,6 +214,9 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
               to_std_string(ns_err.localizedDescription));
     return false;
   }
+
+  impl_->diagnostics_buf = [impl_->device newBufferWithLength:3 * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
 
   // ---- Visible function tables (1 entry each) ----
   auto make_table = [&](id<MTLFunction> fn) -> id<MTLVisibleFunctionTable> {
@@ -311,6 +336,9 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   id<MTLBuffer> step_buf =
       [impl_->device newBufferWithBytes:&step_idx32 length:sizeof(uint32_t)
                                options:MTLResourceStorageModeShared];
+  id<MTLBuffer> lambda_buf =
+      [impl_->device newBufferWithBytes:&config.lambda length:sizeof(float)
+                               options:MTLResourceStorageModeShared];
 
   // ---- Pass 1: Rollout ----
   id<MTLBuffer> x0_buf =
@@ -379,56 +407,33 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
     [enc endEncoding];
   }
 
-  // Submit pass 1 and wait (we need costs on CPU for weight computation).
-  [cmd_buf commit];
-  [cmd_buf waitUntilCompleted];
-
-  if (cmd_buf.status == MTLCommandBufferStatusError) {
-    set_error(error, "Rollout kernel failed: " +
-              to_std_string(cmd_buf.error.localizedDescription));
-    return false;
-  }
-
-  // ---- CPU: compute weights from costs ----
-  const float *costs = static_cast<const float *>(costs_buf.contents);
-
-  float min_cost = costs[0];
-  for (uint32_t k = 1; k < S; ++k)
-    if (costs[k] < min_cost) min_cost = costs[k];
-
-  const float inv_lambda = 1.0f / config.lambda;
-  std::vector<float> weights(S);
-  float weight_sum = 0.0f;
-  for (uint32_t k = 0; k < S; ++k) {
-    weights[k] = std::exp(-(costs[k] - min_cost) * inv_lambda);
-    weight_sum += weights[k];
-  }
-  for (uint32_t k = 0; k < S; ++k) weights[k] /= weight_sum;
-
-  // Diagnostics (computed from costs on CPU).
-  if (diagnostics != nullptr) {
-    diagnostics->best_cost = min_cost;
-    float sum = 0.0f;
-    for (uint32_t k = 0; k < S; ++k) sum += costs[k];
-    diagnostics->mean_cost = sum / static_cast<float>(S);
-    float w2 = 0.0f;
-    for (uint32_t k = 0; k < S; ++k) w2 += weights[k] * weights[k];
-    diagnostics->effective_sample_size = 1.0f / w2;
-    diagnostics->converged = false;
-  }
-
-  // ---- Pass 2: Reduce ----
+  // ---- Pass 2: Weights ----
   id<MTLBuffer> weights_buf =
-      [impl_->device newBufferWithBytes:weights.data()
-                                length:S * sizeof(float)
-                               options:MTLResourceStorageModeShared];
+      [impl_->device newBufferWithLength:S * sizeof(float)
+                                options:MTLResourceStorageModeShared];
+
+  {
+    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+    [enc setComputePipelineState:impl_->weights_pipeline];
+    [enc setBuffer:costs_buf offset:0 atIndex:0];
+    [enc setBuffer:weights_buf offset:0 atIndex:1];
+    [enc setBuffer:impl_->diagnostics_buf offset:0 atIndex:2];
+    [enc setBuffer:sample_buf offset:0 atIndex:3];
+    [enc setBuffer:lambda_buf offset:0 atIndex:4];
+
+    NSUInteger tpg_w = std::min<NSUInteger>(impl_->weights_pipeline.maxTotalThreadsPerThreadgroup, 1024);
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tpg_w, 1, 1)];
+    [enc endEncoding];
+  }
+
+  // ---- Pass 3: Reduce ----
   id<MTLBuffer> u_out_buf =
       [impl_->device newBufferWithLength:seq_len * sizeof(float)
                                 options:MTLResourceStorageModeShared];
 
-  id<MTLCommandBuffer> cmd_buf2 = [impl_->command_queue commandBuffer];
   {
-    id<MTLComputeCommandEncoder> enc = [cmd_buf2 computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->reduce_pipeline];
     [enc setBuffer:weights_buf offset:0 atIndex:0];
     [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
@@ -448,13 +453,22 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
     [enc endEncoding];
   }
 
-  [cmd_buf2 commit];
-  [cmd_buf2 waitUntilCompleted];
+  // Submit all 3 passes and wait
+  [cmd_buf commit];
+  [cmd_buf waitUntilCompleted];
 
-  if (cmd_buf2.status == MTLCommandBufferStatusError) {
-    set_error(error, "Reduce kernel failed: " +
-              to_std_string(cmd_buf2.error.localizedDescription));
+  if (cmd_buf.status == MTLCommandBufferStatusError) {
+    set_error(error, "Command buffer failed: " +
+              to_std_string(cmd_buf.error.localizedDescription));
     return false;
+  }
+
+  if (diagnostics != nullptr) {
+    const float *d = static_cast<const float *>(impl_->diagnostics_buf.contents);
+    diagnostics->best_cost = d[0];
+    diagnostics->mean_cost = d[1];
+    diagnostics->effective_sample_size = d[2];
+    diagnostics->converged = false;
   }
 
   // ---- Read back updated controls ----
