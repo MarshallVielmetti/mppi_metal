@@ -5,7 +5,7 @@
 #include <cmath>
 #include <chrono>
 
-#define N_ADVERSARIES 2
+#define N_ADVERSARIES 4
 
 struct ModelParams {
     float v_max;
@@ -44,7 +44,7 @@ struct AgentState {
 
 int main() {
 
-    const uint32_t N_AGENTS = 512;
+    const uint32_t N_AGENTS = 1024;
     const uint32_t N_STEPS = 100;
     const uint32_t EGO_SDIM = 4;
     const uint32_t CDIM = 2;
@@ -154,6 +154,22 @@ int main() {
         s->adversaries[1].v = m_params.adv_v_max;
         s->adversaries[1].active = false;
         s->adversaries[1].steps_since_active = 50;
+
+        // Adversary 3
+        s->adversaries[2].x = 0.0f;
+        s->adversaries[2].y = 2.0f;
+        s->adversaries[2].theta = -1.57f;
+        s->adversaries[2].v = m_params.adv_v_max;
+        s->adversaries[2].active = false;
+        s->adversaries[2].steps_since_active = 50;
+
+        // Adversary 4
+        s->adversaries[3].x = 0.0f;
+        s->adversaries[3].y = 2.0f;
+        s->adversaries[3].theta = -1.57f;
+        s->adversaries[3].v = m_params.adv_v_max;
+        s->adversaries[3].active = false;
+        s->adversaries[3].steps_since_active = 50;
     }
 
     // Allocate contiguous output buffers
