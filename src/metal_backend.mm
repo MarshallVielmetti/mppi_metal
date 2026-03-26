@@ -456,72 +456,69 @@ bool MetalBackend::dispatch_rollout(
 
   id<MTLCommandBuffer> cmd_buf = [impl_->command_queue commandBuffer];
 
-  // Encode rollout.
-  {
-    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
-    [enc setComputePipelineState:impl_->rollout_pipeline];
-    [enc setBuffer:impl_->x0_buf offset:0 atIndex:0];
-    [enc setBuffer:impl_->u_nom_buf offset:0 atIndex:1];
-    [enc setBuffer:mp_buf offset:0 atIndex:2];
-    [enc setBuffer:cp_buf offset:0 atIndex:3];
-    [enc setBuffer:impl_->costs_buf offset:0 atIndex:4];
-    [enc setBytes:&sdim length:sizeof(uint32_t) atIndex:5];
-    [enc setBytes:&cdim length:sizeof(uint32_t) atIndex:6];
-    [enc setBytes:&H length:sizeof(uint32_t) atIndex:7];
-    [enc setBytes:&S length:sizeof(uint32_t) atIndex:8];
-    [enc setBuffer:impl_->umin_buf offset:0 atIndex:9];
-    [enc setBuffer:impl_->umax_buf offset:0 atIndex:10];
-    [enc setVisibleFunctionTable:impl_->dynamics_table atBufferIndex:11];
-    [enc setVisibleFunctionTable:impl_->stage_cost_table atBufferIndex:12];
-    [enc setVisibleFunctionTable:impl_->terminal_cost_table atBufferIndex:13];
-    [enc setBuffer:impl_->sigma_buf offset:0 atIndex:14];
-    [enc setBytes:&seed length:sizeof(uint32_t) atIndex:15];
-    [enc setBytes:&step_idx32 length:sizeof(uint32_t) atIndex:16];
+  // Encoder Fusion (Level 1): Use one encoder for all passes.
+  id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
 
-    NSUInteger tpg = std::min<NSUInteger>(impl_->rollout_max_tpg, 256);
-    [enc dispatchThreads:MTLSizeMake(S, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-    [enc endEncoding];
-  }
+  // ---- Pass 1: Rollout ----
+  [enc setComputePipelineState:impl_->rollout_pipeline];
+  [enc setBuffer:impl_->x0_buf offset:0 atIndex:0];
+  [enc setBuffer:impl_->u_nom_buf offset:0 atIndex:1];
+  [enc setBuffer:mp_buf offset:0 atIndex:2];
+  [enc setBuffer:cp_buf offset:0 atIndex:3];
+  [enc setBuffer:impl_->costs_buf offset:0 atIndex:4];
+  [enc setBytes:&sdim length:sizeof(uint32_t) atIndex:5];
+  [enc setBytes:&cdim length:sizeof(uint32_t) atIndex:6];
+  [enc setBytes:&H length:sizeof(uint32_t) atIndex:7];
+  [enc setBytes:&S length:sizeof(uint32_t) atIndex:8];
+  [enc setBuffer:impl_->umin_buf offset:0 atIndex:9];
+  [enc setBuffer:impl_->umax_buf offset:0 atIndex:10];
+  [enc setVisibleFunctionTable:impl_->dynamics_table atBufferIndex:11];
+  [enc setVisibleFunctionTable:impl_->stage_cost_table atBufferIndex:12];
+  [enc setVisibleFunctionTable:impl_->terminal_cost_table atBufferIndex:13];
+  [enc setBuffer:impl_->sigma_buf offset:0 atIndex:14];
+  [enc setBytes:&seed length:sizeof(uint32_t) atIndex:15];
+  [enc setBytes:&step_idx32 length:sizeof(uint32_t) atIndex:16];
+
+  NSUInteger tpg = std::min<NSUInteger>(impl_->rollout_max_tpg, 256);
+  [enc dispatchThreads:MTLSizeMake(S, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+
+  [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
   // ---- Pass 2: Weights ----
-  {
-    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
-    [enc setComputePipelineState:impl_->weights_pipeline];
-    [enc setBuffer:impl_->costs_buf offset:0 atIndex:0];
-    [enc setBuffer:impl_->weights_buf offset:0 atIndex:1];
-    [enc setBuffer:impl_->diagnostics_buf offset:0 atIndex:2];
-    [enc setBytes:&S length:sizeof(uint32_t) atIndex:3];
-    [enc setBytes:&lambda length:sizeof(float) atIndex:4];
+  [enc setComputePipelineState:impl_->weights_pipeline];
+  [enc setBuffer:impl_->costs_buf offset:0 atIndex:0];
+  [enc setBuffer:impl_->weights_buf offset:0 atIndex:1];
+  [enc setBuffer:impl_->diagnostics_buf offset:0 atIndex:2];
+  [enc setBytes:&S length:sizeof(uint32_t) atIndex:3];
+  [enc setBytes:&lambda length:sizeof(float) atIndex:4];
 
-    NSUInteger tpg_w = std::min<NSUInteger>(
-        impl_->weights_pipeline.maxTotalThreadsPerThreadgroup, 1024);
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tpg_w, 1, 1)];
-    [enc endEncoding];
-  }
+  NSUInteger tpg_w = std::min<NSUInteger>(
+      impl_->weights_pipeline.maxTotalThreadsPerThreadgroup, 1024);
+  [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(tpg_w, 1, 1)];
+
+  [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
   // ---- Pass 3: Reduce ----
-  {
-    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
-    [enc setComputePipelineState:impl_->reduce_pipeline];
-    [enc setBuffer:impl_->weights_buf offset:0 atIndex:0];
-    [enc setBuffer:impl_->u_nom_buf offset:0 atIndex:1];
-    [enc setBuffer:impl_->u_out_buf offset:0 atIndex:2];
-    [enc setBuffer:impl_->sigma_buf offset:0 atIndex:3];
-    [enc setBuffer:impl_->umin_buf offset:0 atIndex:4];
-    [enc setBuffer:impl_->umax_buf offset:0 atIndex:5];
-    [enc setBytes:&S length:sizeof(uint32_t) atIndex:6];
-    [enc setBytes:&H length:sizeof(uint32_t) atIndex:7];
-    [enc setBytes:&cdim length:sizeof(uint32_t) atIndex:8];
-    [enc setBytes:&seed length:sizeof(uint32_t) atIndex:9];
-    [enc setBytes:&step_idx32 length:sizeof(uint32_t) atIndex:10];
+  [enc setComputePipelineState:impl_->reduce_pipeline];
+  [enc setBuffer:impl_->weights_buf offset:0 atIndex:0];
+  [enc setBuffer:impl_->u_nom_buf offset:0 atIndex:1];
+  [enc setBuffer:impl_->u_out_buf offset:0 atIndex:2];
+  [enc setBuffer:impl_->sigma_buf offset:0 atIndex:3];
+  [enc setBuffer:impl_->umin_buf offset:0 atIndex:4];
+  [enc setBuffer:impl_->umax_buf offset:0 atIndex:5];
+  [enc setBytes:&S length:sizeof(uint32_t) atIndex:6];
+  [enc setBytes:&H length:sizeof(uint32_t) atIndex:7];
+  [enc setBytes:&cdim length:sizeof(uint32_t) atIndex:8];
+  [enc setBytes:&seed length:sizeof(uint32_t) atIndex:9];
+  [enc setBytes:&step_idx32 length:sizeof(uint32_t) atIndex:10];
 
-    NSUInteger tpg2 = std::min<NSUInteger>(impl_->reduce_max_tpg, 256);
-    [enc dispatchThreads:MTLSizeMake(seq_len, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tpg2, 1, 1)];
-    [enc endEncoding];
-  }
+  NSUInteger tpg2 = std::min<NSUInteger>(impl_->reduce_max_tpg, 256);
+  [enc dispatchThreads:MTLSizeMake(seq_len, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(tpg2, 1, 1)];
+
+  [enc endEncoding];
 
   // Submit all 3 passes and wait
   [cmd_buf commit];
@@ -608,11 +605,12 @@ bool MetalBackend::dispatch_simulation(
 
   id<MTLCommandBuffer> cmd_buf = [impl_->command_queue commandBuffer];
 
+  id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
   for (uint32_t step = 0; step < num_steps; step++) {
     uint32_t step_idx32 = static_cast<uint32_t>(start_step_index + step);
 
     // Pass 1: Rollout
-    id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+    // id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->rollout_pipeline];
     [enc setBuffer:impl_->x0_buf offset:0 atIndex:0];
     [enc setBuffer:impl_->u_nom_buf offset:0 atIndex:1];
@@ -638,10 +636,11 @@ bool MetalBackend::dispatch_simulation(
                                           .maxTotalThreadsPerThreadgroup,
                                       256),
                                   1, 1)];
-    [enc endEncoding];
+    // [enc endEncoding];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // Pass 2: Weights
-    enc = [cmd_buf computeCommandEncoder];
+    // enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->weights_pipeline];
     [enc setBuffer:impl_->costs_buf offset:0 atIndex:0];
     [enc setBuffer:impl_->weights_buf offset:0 atIndex:1];
@@ -655,10 +654,11 @@ bool MetalBackend::dispatch_simulation(
                                           .maxTotalThreadsPerThreadgroup,
                                       1024),
                                   1, 1)];
-    [enc endEncoding];
+    // [enc endEncoding];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // Pass 3: Reduce
-    enc = [cmd_buf computeCommandEncoder];
+    // enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->reduce_pipeline];
     [enc setBuffer:impl_->weights_buf offset:0 atIndex:0];
     [enc setBuffer:impl_->u_nom_buf offset:0 atIndex:1];
@@ -678,10 +678,11 @@ bool MetalBackend::dispatch_simulation(
                                           .maxTotalThreadsPerThreadgroup,
                                       256),
                                   1, 1)];
-    [enc endEncoding];
+    // [enc endEncoding];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // Pass 4: Propagate & Shift
-    enc = [cmd_buf computeCommandEncoder];
+    // enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->propagate_pipeline];
     [enc setBuffer:impl_->x0_buf offset:0 atIndex:0];
     [enc setBuffer:impl_->u_nom_buf offset:0 atIndex:1];
@@ -704,9 +705,11 @@ bool MetalBackend::dispatch_simulation(
                                           .maxTotalThreadsPerThreadgroup,
                                       256),
                                   1, 1)];
-    [enc endEncoding];
+    // [enc endEncoding];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
   }
 
+  [enc endEncoding];
   [cmd_buf commit];
   [cmd_buf waitUntilCompleted];
 
