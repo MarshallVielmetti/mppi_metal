@@ -8,6 +8,12 @@
 struct ModelParams {
     float v_max;
     float dt;
+
+    // Adversary parameters
+    float adv_v_max;
+    int adv_max_steps;
+    int num_adversaries;    // number of adversaries < 32
+    int active_adversaries; // bitmask of active adversaries
 };
 
 struct CostParams {
@@ -17,13 +23,29 @@ struct CostParams {
     float pos_weight;
     float heading_weight;
     float control_weight;
+
+    // Adversary parameters
+    float collision_radius;
+    float adv_collision_weight;
+    float adv_dist_weight;
 };
 
+
 int main() {
+
+    const uint32_t N_AGENTS = 512;
+    const uint32_t N_STEPS = 100;
+    const uint32_t EGO_SDIM = 4;
+    const uint32_t CDIM = 2;
+    const uint32_t N_ADVERSARIES = 2;
+    const uint32_t ADVERSARY_SDIM = 4;
+
+    const uint32_t SDIM = EGO_SDIM + N_ADVERSARIES * ADVERSARY_SDIM;
+
     // ---- MPPI Configuration ----
     mppi_metal::DriverConfig config;
-    config.state_dim = 4;
-    config.control_dim = 2;
+    config.state_dim = SDIM;
+    config.control_dim = CDIM;
     config.horizon = 20;
     config.sample_count = 256;
     config.lambda = 1.0f;
@@ -70,6 +92,12 @@ int main() {
     m_params.v_max = 2.0f;
     m_params.dt = 0.05f;
 
+    // Adversary parameters
+    m_params.adv_v_max = 1.5f;
+    m_params.adv_max_steps = 100;
+    m_params.num_adversaries = N_ADVERSARIES;
+    m_params.active_adversaries = (1 << N_ADVERSARIES) - 1;
+
     CostParams c_params;
     c_params.x_goal = 5.0f;
     c_params.y_goal = 5.0f;
@@ -77,6 +105,11 @@ int main() {
     c_params.pos_weight = 10.0f;
     c_params.heading_weight = 0.0f;
     c_params.control_weight = 0.1f;
+
+    // Adversary parameters
+    c_params.collision_radius = 0.5f;
+    c_params.adv_collision_weight = 100.0f;
+    c_params.adv_dist_weight = 0.0f;
 
     mppi_metal::ProblemParams params;
     params.model_params = {reinterpret_cast<uint8_t*>(&m_params), sizeof(ModelParams)};
@@ -87,14 +120,25 @@ int main() {
         return 1;
     }
 
-    // ---- Batched Simulation ----
-    const uint32_t N_AGENTS = 512;
-    const uint32_t N_STEPS = 100;
-    const uint32_t SDIM = 4;
-    const uint32_t CDIM = 2;
-
     // All agents start at origin: [x=0, y=0, theta=0, v=0]
+    // Adversaries start at different locations.
     std::vector<float> x0_packed(N_AGENTS * SDIM, 0.0f);
+    for (uint32_t a = 0; a < N_AGENTS; ++a) {
+        uint32_t base = a * SDIM;
+        // Ego: [0, 1, 2, 3] = 0
+        
+        // Adversary 1: [4, 5, 6, 7]
+        x0_packed[base + 4] = 2.0f; // x
+        x0_packed[base + 5] = 0.0f; // y
+        x0_packed[base + 6] = 3.14f; // theta (pointing towards ego)
+        x0_packed[base + 7] = m_params.adv_v_max; // v
+        
+        // Adversary 2: [8, 9, 10, 11]
+        x0_packed[base + 8] = 0.0f; // x
+        x0_packed[base + 9] = 2.0f; // y
+        x0_packed[base + 10] = -1.57f; // theta (pointing towards ego)
+        x0_packed[base + 11] = m_params.adv_v_max; // v
+    }
 
     // Allocate contiguous output buffers
     std::vector<float> states_out(N_AGENTS * N_STEPS * SDIM);
@@ -129,7 +173,11 @@ int main() {
 
     // ---- Write CSV output ----
     std::ofstream csv("trajectory_batch.csv");
-    csv << "sim_id,step,x,y,theta,v,a_cmd,omega_cmd,best_cost\n";
+    csv << "sim_id,step,x,y,theta,v,a_cmd,omega_cmd,best_cost";
+    for (uint32_t i = 0; i < N_ADVERSARIES; ++i) {
+        csv << ",x_adv_" << i+1 << ",y_adv_" << i+1 << ",th_adv_" << i+1 << ",v_adv_" << i+1;
+    }
+    csv << "\n";
 
     int reached_goal = 0;
     for (uint32_t a = 0; a < N_AGENTS; ++a) {
@@ -147,9 +195,18 @@ int main() {
             float omega_cmd = controls_out[c_base + 1];
             float best_cost = costs_out[cost_idx];
 
-            // csv << a << "," << step << "," << x << "," << y << ","
-            //     << theta << "," << v << "," << a_cmd << ","
-            //     << omega_cmd << "," << best_cost << "\n";
+            csv << a << "," << step << "," << x << "," << y << ","
+                << theta << "," << v << "," << a_cmd << ","
+                << omega_cmd << "," << best_cost;
+
+            for (uint32_t i = 0; i < N_ADVERSARIES; ++i) {
+                uint32_t adv_base = s_base + EGO_SDIM + i * ADVERSARY_SDIM;
+                csv << "," << states_out[adv_base + 0] 
+                    << "," << states_out[adv_base + 1]
+                    << "," << states_out[adv_base + 2]
+                    << "," << states_out[adv_base + 3];
+            }
+            csv << "\n";
 
             float dx = x - c_params.x_goal;
             float dy = y - c_params.y_goal;

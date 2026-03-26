@@ -67,9 +67,10 @@ void mppi_dynamics(
             float target_theta = atan2(dy, dx);
             
             // Normalize angle error to [-pi, pi]
-            float error = target_theta - adv_theta;
-            while (error >  3.1415926535f) error -= 2.0f * 3.1415926535f;
-            while (error < -3.1415926535f) error += 2.0f * 3.1415926535f;
+            float pi = 3.1415926535f;
+            float error = fmod(target_theta - adv_theta + pi, 2.0f * pi);
+            if (error < 0) error += 2.0f * pi;
+            error -= pi;
             
             float k = 2.0f; // steering gain
             float adv_omega = k * error;
@@ -121,13 +122,15 @@ float mppi_stage_cost(
             uint base = 4 + i * 4;
             float adv_x = state[base];
             float adv_y = state[base + 1];
-            float dx = state[0] - adv_x;
-            float dy = state[1] - adv_y;
-            float dist2 = dx*dx + dy*dy;
-            cost += params->adv_collision_weight * exp(-dist2 / (params->collision_radius * params->collision_radius));
+            float d_adv_x = state[0] - adv_x;
+            float d_adv_y = state[1] - adv_y;
+            float dist_to_adv2 = d_adv_x*d_adv_x + d_adv_y*d_adv_y;
+
+            // Gaussian collision cost
+            float r2 = params->collision_radius * params->collision_radius + 1e-6f;
+            cost += params->adv_collision_weight * exp(-dist_to_adv2 / r2);
         }
     }
-
     
     return cost;
 }
