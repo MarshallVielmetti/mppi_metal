@@ -205,12 +205,14 @@ void mppi_propagate_and_shift(
             control_copy[i] = u_optimal[i];
             if (history_controls) history_controls[step_index * control_dim + i] = u_optimal[i];
         }
-        
         if (history_costs) history_costs[step_index] = diagnostics[0];
 
         // Propagate state
-        dynamics_table[0](state_copy, control_copy, model_params);
-        
+        // For shift, we just use a baseline counter
+        uint2 dyn_ctr = uint2(step_index, 0x80000000);
+        // We use a dummy seed of 0 since shift pass doesn't get a seed 
+        dynamics_table[0](state_copy, control_copy, model_params, dyn_ctr, 0);
+
         for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
             current_x[i] = state_view[i];
         }
@@ -460,7 +462,9 @@ void mppi_propagate_and_shift_batch(
             history_costs[agent_idx * num_steps + step_index] = diagnostics[agent_idx * 3 + 0];
         }
 
-        dynamics_table[0](state_copy, control_copy, model_params);
+        // Just use agent_idx + step_index as a dummy seed for propagation
+        uint2 dyn_ctr = uint2(step_index, 0x80000000);
+        dynamics_table[0](state_copy, control_copy, model_params, dyn_ctr, agent_idx);
 
         for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
             current_x_packed[agent_idx * state_dim + i] = state_view[i];

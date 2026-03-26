@@ -86,7 +86,8 @@ void mppi_rollout(
             }
         }
 
-        dynamics_table[0](state, control, model_params);
+        uint2 dyn_ctr = uint2(step_index, gid * horizon * pairs_per_step + t + 0x80000000);
+        dynamics_table[0](state, control, model_params, dyn_ctr, rng_seed);
         total_cost += stage_cost_table[0](state, control, model_params, cost_params);
     }
 
@@ -159,7 +160,8 @@ void mppi_rollout_batch(
             }
         }
 
-        dynamics_table[0](state, control, model_params);
+        uint2 dyn_ctr = uint2(step_index, sample_idx * horizon * pairs_per_step + t + 0x80000000);
+        dynamics_table[0](state, control, model_params, dyn_ctr, agent_key);
         total_cost += stage_cost_table[0](state, control, model_params, cost_params);
     }
 

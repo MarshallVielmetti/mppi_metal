@@ -10,7 +10,9 @@
 /// In-place state propagation (may mutate state).
 using MppiDynamicsFn = void(thread uint8_t* state,
                             thread const float* control,
-                            device const uint8_t* model_params);
+                            device const uint8_t* model_params,
+                            uint2 rng_counter,
+                            uint rng_seed);
 
 /// Per-timestep running cost (must not mutate state).
 using MppiStageCostFn = float(thread const uint8_t* state,

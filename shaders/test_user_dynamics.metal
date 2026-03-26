@@ -7,10 +7,13 @@ using namespace metal;
 // State: [px, py, vx, vy], Control: [ax, ay], dt = 0.1
 [[visible]]
 void mppi_dynamics(
-    thread float* state,
+    thread uint8_t* state_raw,
     thread const float* control,
-    device const uint8_t* model_params
+    device const uint8_t* model_params_raw,
+    uint2 rng_counter,
+    uint rng_seed
 ) {
+    thread float* state = (thread float*)state_raw;
     float dt = 0.1f;
     state[0] += state[2] * dt;  // px += vx * dt
     state[1] += state[3] * dt;  // py += vy * dt

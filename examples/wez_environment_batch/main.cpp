@@ -5,6 +5,8 @@
 #include <cmath>
 #include <chrono>
 
+#define N_ADVERSARIES 2
+
 struct ModelParams {
     float v_max;
     float dt;
@@ -13,7 +15,6 @@ struct ModelParams {
     float adv_v_max;
     int adv_max_steps;
     int num_adversaries;    // number of adversaries < 32
-    int active_adversaries; // bitmask of active adversaries
 };
 
 struct CostParams {
@@ -30,6 +31,16 @@ struct CostParams {
     float adv_dist_weight;
 };
 
+struct Adversary {
+    float x, y, theta, v;
+    uint16_t steps_since_active;
+    bool active;
+};
+
+struct AgentState {
+    float x, y, theta, v;
+    Adversary adversaries[N_ADVERSARIES]; // Matches N_ADVERSARIES
+};
 
 int main() {
 
@@ -37,10 +48,12 @@ int main() {
     const uint32_t N_STEPS = 100;
     const uint32_t EGO_SDIM = 4;
     const uint32_t CDIM = 2;
-    const uint32_t N_ADVERSARIES = 2;
-    const uint32_t ADVERSARY_SDIM = 4;
+
+    // 4 floats + 1 bool + 1 uint16_t -> Packed into 5 'floats' worth of space by struct rules
+    const uint32_t ADVERSARY_SDIM = 5; 
 
     const uint32_t SDIM = EGO_SDIM + N_ADVERSARIES * ADVERSARY_SDIM;
+    static_assert(sizeof(AgentState) == SDIM * sizeof(float), "AgentState layout mismatch");
 
     // ---- MPPI Configuration ----
     mppi_metal::DriverConfig config;
@@ -96,7 +109,6 @@ int main() {
     m_params.adv_v_max = 1.5f;
     m_params.adv_max_steps = 100;
     m_params.num_adversaries = N_ADVERSARIES;
-    m_params.active_adversaries = (1 << N_ADVERSARIES) - 1;
 
     CostParams c_params;
     c_params.x_goal = 5.0f;
@@ -124,20 +136,24 @@ int main() {
     // Adversaries start at different locations.
     std::vector<float> x0_packed(N_AGENTS * SDIM, 0.0f);
     for (uint32_t a = 0; a < N_AGENTS; ++a) {
-        uint32_t base = a * SDIM;
-        // Ego: [0, 1, 2, 3] = 0
+        AgentState* s = reinterpret_cast<AgentState*>(&x0_packed[a * SDIM]);
+        // Ego: [x,y,th,v] = 0 (already zeroed)
         
-        // Adversary 1: [4, 5, 6, 7]
-        x0_packed[base + 4] = 2.0f; // x
-        x0_packed[base + 5] = 0.0f; // y
-        x0_packed[base + 6] = 3.14f; // theta (pointing towards ego)
-        x0_packed[base + 7] = m_params.adv_v_max; // v
+        // Adversary 1
+        s->adversaries[0].x = 2.0f;
+        s->adversaries[0].y = 0.0f;
+        s->adversaries[0].theta = 3.14f;
+        s->adversaries[0].v = m_params.adv_v_max;
+        s->adversaries[0].active = false;
+        s->adversaries[0].steps_since_active = 0;
         
-        // Adversary 2: [8, 9, 10, 11]
-        x0_packed[base + 8] = 0.0f; // x
-        x0_packed[base + 9] = 2.0f; // y
-        x0_packed[base + 10] = -1.57f; // theta (pointing towards ego)
-        x0_packed[base + 11] = m_params.adv_v_max; // v
+        // Adversary 2
+        s->adversaries[1].x = 0.0f;
+        s->adversaries[1].y = 2.0f;
+        s->adversaries[1].theta = -1.57f;
+        s->adversaries[1].v = m_params.adv_v_max;
+        s->adversaries[1].active = false;
+        s->adversaries[1].steps_since_active = 50;
     }
 
     // Allocate contiguous output buffers

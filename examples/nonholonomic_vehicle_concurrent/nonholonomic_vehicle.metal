@@ -22,12 +22,16 @@ struct CostParams {
 // Control: [a, omega]
 [[visible]]
 void mppi_dynamics(
-    thread float* state,
+    thread uint8_t* state_raw,
     thread const float* control,
-    device const uint8_t* model_params_raw
+    device const uint8_t* model_params_raw,
+    uint2 rng_counter,
+    uint rng_seed
 ) {
     device const ModelParams* params = (device const ModelParams*)model_params_raw;
     float dt = params->dt;
+    
+    thread float* state = (thread float*)state_raw;
     
     float theta = state[2];
     float v = state[3];
