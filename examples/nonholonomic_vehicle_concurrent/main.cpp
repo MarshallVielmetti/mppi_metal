@@ -79,6 +79,8 @@ int main() {
     c_params.heading_weight = 0.0f;
     c_params.control_weight = 0.1f;
 
+    const int N_STEPS = 85;
+
     mppi_metal::ProblemParams params;
     params.model_params = {reinterpret_cast<uint8_t*>(&m_params), sizeof(ModelParams)};
     params.cost_params = {reinterpret_cast<uint8_t*>(&c_params), sizeof(CostParams)};
@@ -122,26 +124,26 @@ int main() {
                 local_driver.reset(nullptr);
                 std::stringstream local_csv;
 
-                std::vector<float> states_out(300 * 4);
-                std::vector<float> controls_out(300 * 2);
-                std::vector<float> costs_out(300);
+                std::vector<float> states_out(N_STEPS * 4);
+                std::vector<float> controls_out(N_STEPS * 2);
+                std::vector<float> costs_out(N_STEPS);
 
                 mppi_metal::SimulationResults results;
                 results.states_out = states_out.data();
                 results.controls_out = controls_out.data();
                 results.costs_out = costs_out.data();
-                results.num_steps = 300;
+                results.num_steps = N_STEPS;
 
                 mppi_metal::StepInputs inputs;
                 inputs.x0 = {state.data(), static_cast<uint32_t>(state.size())};
 
-                if (!local_driver.simulate(300, inputs, results, &local_error)) {
+                if (!local_driver.simulate(N_STEPS, inputs, results, &local_error)) {
                     std::cerr << "Sim " << sim << " failed: " << local_error << "\n";
                     break;
                 }
 
-                int steps_taken = 300;
-                for (int step = 0; step < 300; ++step) {
+                int steps_taken = N_STEPS;
+                for (int step = 0; step < N_STEPS; ++step) {
                     float x = states_out[step * 4 + 0];
                     float y = states_out[step * 4 + 1];
                     float theta = states_out[step * 4 + 2];
