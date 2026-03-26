@@ -193,9 +193,10 @@ void mppi_propagate_and_shift(
     if (gid >= seq_len) return;
 
     if (gid == 0) {
-        float state_copy[MPPI_MAX_STATE_DIM];
-        for (uint i = 0; i < state_dim && i < MPPI_MAX_STATE_DIM; ++i) {
-            state_copy[i] = current_x[i];
+        uint8_t state_copy[MPPI_MAX_STATE_BYTES];
+        thread float* state_view = (thread float*)state_copy;
+        for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
+            state_view[i] = current_x[i];
             if (history_states) history_states[step_index * state_dim + i] = current_x[i];
         }
         
@@ -210,8 +211,8 @@ void mppi_propagate_and_shift(
         // Propagate state
         dynamics_table[0](state_copy, control_copy, model_params);
         
-        for (uint i = 0; i < state_dim && i < MPPI_MAX_STATE_DIM; ++i) {
-            current_x[i] = state_copy[i];
+        for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
+            current_x[i] = state_view[i];
         }
     }
 
@@ -436,9 +437,10 @@ void mppi_propagate_and_shift_batch(
 
     if (flat_idx == 0) {
         // Propagate this agent's state using its first optimal control.
-        float state_copy[MPPI_MAX_STATE_DIM];
-        for (uint i = 0; i < state_dim && i < MPPI_MAX_STATE_DIM; ++i) {
-            state_copy[i] = current_x_packed[agent_idx * state_dim + i];
+        uint8_t state_copy[MPPI_MAX_STATE_BYTES];
+        thread float* state_view = (thread float*)state_copy;
+        for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
+            state_view[i] = current_x_packed[agent_idx * state_dim + i];
             if (history_states) {
                 history_states[agent_idx * num_steps * state_dim + step_index * state_dim + i] =
                     current_x_packed[agent_idx * state_dim + i];
@@ -460,8 +462,8 @@ void mppi_propagate_and_shift_batch(
 
         dynamics_table[0](state_copy, control_copy, model_params);
 
-        for (uint i = 0; i < state_dim && i < MPPI_MAX_STATE_DIM; ++i) {
-            current_x_packed[agent_idx * state_dim + i] = state_copy[i];
+        for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
+            current_x_packed[agent_idx * state_dim + i] = state_view[i];
         }
     }
 

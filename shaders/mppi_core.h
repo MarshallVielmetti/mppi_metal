@@ -8,18 +8,18 @@
 // ---------------------------------------------------------------------------
 
 /// In-place state propagation (may mutate state).
-using MppiDynamicsFn = void(thread float* state,
+using MppiDynamicsFn = void(thread uint8_t* state,
                             thread const float* control,
                             device const uint8_t* model_params);
 
 /// Per-timestep running cost (must not mutate state).
-using MppiStageCostFn = float(thread const float* state,
+using MppiStageCostFn = float(thread const uint8_t* state,
                               thread const float* control,
                               device const uint8_t* model_params,
                               device const uint8_t* cost_params);
 
 /// Terminal cost at end of horizon (must not mutate state).
-using MppiTerminalCostFn = float(thread const float* state,
+using MppiTerminalCostFn = float(thread const uint8_t* state,
                                  device const uint8_t* model_params,
                                  device const uint8_t* cost_params);
 
@@ -27,7 +27,7 @@ using MppiTerminalCostFn = float(thread const float* state,
 // Thread-local array size limits.
 // ---------------------------------------------------------------------------
 
-constant uint MPPI_MAX_STATE_DIM   = 32;
+constant uint MPPI_MAX_STATE_BYTES = 128;
 constant uint MPPI_MAX_CONTROL_DIM = 16;
 
 // ---------------------------------------------------------------------------

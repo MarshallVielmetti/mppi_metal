@@ -10,7 +10,7 @@ using namespace metal;
 
 [[visible]]
 float mppi_default_stage_cost(
-    thread const float* state,
+    thread const uint8_t* state,
     thread const float* control,
     device const uint8_t* model_params,
     device const uint8_t* cost_params
@@ -20,7 +20,7 @@ float mppi_default_stage_cost(
 
 [[visible]]
 float mppi_default_terminal_cost(
-    thread const float* state,
+    thread const uint8_t* state,
     device const uint8_t* model_params,
     device const uint8_t* cost_params
 ) {
@@ -57,9 +57,10 @@ void mppi_rollout(
     if (gid >= sample_count) return;
 
     // Thread-local state (copy from x0).
-    float state[MPPI_MAX_STATE_DIM];
-    for (uint d = 0; d < state_dim && d < MPPI_MAX_STATE_DIM; d++) {
-        state[d] = x0[d];
+    uint8_t state[MPPI_MAX_STATE_BYTES];
+    thread float* state_view = (thread float*)state;
+    for (uint d = 0; d < state_dim && d < (MPPI_MAX_STATE_BYTES / 4); d++) {
+        state_view[d] = x0[d];
     }
 
     uint pairs_per_step = (control_dim + 1) / 2;
@@ -130,9 +131,10 @@ void mppi_rollout_batch(
     device const float* x0       = x0_packed + agent_idx * state_dim;
     device const float* u_nominal = u_nom_packed + agent_idx * horizon * control_dim;
 
-    float state[MPPI_MAX_STATE_DIM];
-    for (uint d = 0; d < state_dim && d < MPPI_MAX_STATE_DIM; d++) {
-        state[d] = x0[d];
+    uint8_t state[MPPI_MAX_STATE_BYTES];
+    thread float* state_view = (thread float*)state;
+    for (uint d = 0; d < state_dim && d < (MPPI_MAX_STATE_BYTES / 4); d++) {
+        state_view[d] = x0[d];
     }
 
     uint pairs_per_step = (control_dim + 1) / 2;
