@@ -24,11 +24,15 @@ def main():
         print(f"Error reading {csv_file}: {e}")
         return
 
-    # Infer number of adversaries from header
-    # Header format: sim_id,step,x,y,theta,v,a_cmd,omega_cmd,best_cost,x_adv_1,y_adv_1,th_adv_1,v_adv_1...
+    # Infer number of adversaries and captured column from header
+    # Header format: sim_id,step,x,y,theta,v,a_cmd,omega_cmd,captured,best_cost,x_adv_1,y_adv_1,th_adv_1,v_adv_1...
     adv_cols = [i for i, h in enumerate(header) if 'x_adv_' in h]
     num_adversaries = len(adv_cols)
     print(f"Found {num_adversaries} adversaries in data.")
+    
+    captured_col = header.index('captured') if 'captured' in header else -1
+    if captured_col == -1:
+        print("Warning: 'captured' column not found in CSV header.")
 
     sim_ids = np.unique(data[:, 0])
     
@@ -56,6 +60,14 @@ def main():
         y_ego = sim_data[:, 3]
         ax.plot(x_ego, y_ego, label=f'Ego Sim {int(sim_id)}', alpha=0.8, linewidth=2)
         ax.plot(x_ego[0], y_ego[0], 'ko', markersize=4) # Start point
+
+        # Plot captured points
+        if captured_col != -1:
+            captured_mask = sim_data[:, captured_col].astype(bool)
+            if np.any(captured_mask):
+                x_captured = x_ego[captured_mask]
+                y_captured = y_ego[captured_mask]
+                ax.plot(x_captured, y_captured, 'rx', markersize=8, label='Captured' if i == 0 else "")
 
         # Adversary trajectories
         for adv_idx in range(num_adversaries):

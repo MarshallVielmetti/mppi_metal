@@ -5,7 +5,7 @@
 #include <cmath>
 #include <chrono>
 
-#define N_ADVERSARIES 4
+#define N_ADVERSARIES 8
 
 struct ModelParams {
     float v_max;
@@ -13,6 +13,11 @@ struct ModelParams {
 
     // Adversary parameters
     float adv_v_max;
+    float adv_fire_prob_max;
+    float adv_max_range;
+    float adv_min_range;
+    float adv_k_gain;
+    float adv_capture_radius;
     int adv_max_steps;
     int num_adversaries;    // number of adversaries < 32
 };
@@ -26,7 +31,6 @@ struct CostParams {
     float control_weight;
 
     // Adversary parameters
-    float collision_radius;
     float adv_collision_weight;
     float adv_dist_weight;
 };
@@ -35,18 +39,20 @@ struct Adversary {
     float x, y, theta, v;
     uint16_t steps_since_active;
     bool active;
+    bool terminal;
 };
 
 struct AgentState {
     float x, y, theta, v;
+    bool captured;
     Adversary adversaries[N_ADVERSARIES]; // Matches N_ADVERSARIES
 };
 
 int main() {
 
-    const uint32_t N_AGENTS = 1024;
+    const uint32_t N_AGENTS = 256;
     const uint32_t N_STEPS = 100;
-    const uint32_t EGO_SDIM = 4;
+    const uint32_t EGO_SDIM = 5; // 4 floats + 1 bool, struct packing makes this 5 floats
     const uint32_t CDIM = 2;
 
     // 4 floats + 1 bool + 1 uint16_t -> Packed into 5 'floats' worth of space by struct rules
@@ -60,7 +66,7 @@ int main() {
     config.state_dim = SDIM;
     config.control_dim = CDIM;
     config.horizon = 20;
-    config.sample_count = 256;
+    config.sample_count = 128;
     config.lambda = 1.0f;
 
     // Control Noise: [acceleration, omega]
@@ -106,9 +112,14 @@ int main() {
     m_params.dt = 0.05f;
 
     // Adversary parameters
-    m_params.adv_v_max = 1.5f;
+    m_params.adv_v_max = 2.0f;
     m_params.adv_max_steps = 100;
     m_params.num_adversaries = N_ADVERSARIES;
+    m_params.adv_fire_prob_max = 0.1f;
+    m_params.adv_max_range = 8.0f;
+    m_params.adv_min_range = 3.0f;
+    m_params.adv_k_gain = 3.0f;
+    m_params.adv_capture_radius = 0.5f;
 
     CostParams c_params;
     c_params.x_goal = 5.0f;
@@ -119,7 +130,6 @@ int main() {
     c_params.control_weight = 0.1f;
 
     // Adversary parameters
-    c_params.collision_radius = 0.5f;
     c_params.adv_collision_weight = 100.0f;
     c_params.adv_dist_weight = 0.0f;
 
@@ -145,6 +155,7 @@ int main() {
         s->adversaries[0].theta = 3.14f;
         s->adversaries[0].v = m_params.adv_v_max;
         s->adversaries[0].active = false;
+        s->adversaries[0].terminal = false;
         s->adversaries[0].steps_since_active = 0;
         
         // Adversary 2
@@ -153,6 +164,7 @@ int main() {
         s->adversaries[1].theta = -1.57f;
         s->adversaries[1].v = m_params.adv_v_max;
         s->adversaries[1].active = false;
+        s->adversaries[1].terminal = false;
         s->adversaries[1].steps_since_active = 50;
 
         // Adversary 3
@@ -161,6 +173,7 @@ int main() {
         s->adversaries[2].theta = -1.57f;
         s->adversaries[2].v = m_params.adv_v_max;
         s->adversaries[2].active = false;
+        s->adversaries[2].terminal = false;
         s->adversaries[2].steps_since_active = 50;
 
         // Adversary 4
@@ -169,7 +182,44 @@ int main() {
         s->adversaries[3].theta = -1.57f;
         s->adversaries[3].v = m_params.adv_v_max;
         s->adversaries[3].active = false;
+        s->adversaries[3].terminal = false;
         s->adversaries[3].steps_since_active = 50;
+
+        // Adversary 5
+        s->adversaries[4].x = 0.0f;
+        s->adversaries[4].y = 2.0f;
+        s->adversaries[4].theta = -1.57f;
+        s->adversaries[4].v = m_params.adv_v_max;
+        s->adversaries[4].active = false;
+        s->adversaries[4].terminal = false;
+        s->adversaries[4].steps_since_active = 50;
+
+        // Adversary 6
+        s->adversaries[5].x = 0.0f;
+        s->adversaries[5].y = 2.0f;
+        s->adversaries[5].theta = -1.57f;
+        s->adversaries[5].v = m_params.adv_v_max;
+        s->adversaries[5].active = false;
+        s->adversaries[5].terminal = false;
+        s->adversaries[5].steps_since_active = 50;
+
+        // Adversary 7
+        s->adversaries[6].x = 0.0f;
+        s->adversaries[6].y = 2.0f;
+        s->adversaries[6].theta = -1.57f;
+        s->adversaries[6].v = m_params.adv_v_max;
+        s->adversaries[6].active = false;
+        s->adversaries[6].terminal = false;
+        s->adversaries[6].steps_since_active = 50;
+
+        // Adversary 8
+        s->adversaries[7].x = 0.0f;
+        s->adversaries[7].y = 2.0f;
+        s->adversaries[7].theta = -1.57f;
+        s->adversaries[7].v = m_params.adv_v_max;
+        s->adversaries[7].active = false;
+        s->adversaries[7].terminal = false;
+        s->adversaries[7].steps_since_active = 50;
     }
 
     // Allocate contiguous output buffers
@@ -205,7 +255,7 @@ int main() {
 
     // ---- Write CSV output ----
     std::ofstream csv("trajectory_batch.csv");
-    csv << "sim_id,step,x,y,theta,v,a_cmd,omega_cmd,best_cost";
+    csv << "sim_id,step,x,y,theta,v,a_cmd,omega_cmd,captured,best_cost";
     for (uint32_t i = 0; i < N_ADVERSARIES; ++i) {
         csv << ",x_adv_" << i+1 << ",y_adv_" << i+1 << ",th_adv_" << i+1 << ",v_adv_" << i+1;
     }
@@ -226,10 +276,11 @@ int main() {
             float a_cmd = controls_out[c_base + 0];
             float omega_cmd = controls_out[c_base + 1];
             float best_cost = costs_out[cost_idx];
+            bool captured = states_out[s_base + 4];
 
             csv << a << "," << step << "," << x << "," << y << ","
                 << theta << "," << v << "," << a_cmd << ","
-                << omega_cmd << "," << best_cost;
+                << omega_cmd << "," << captured << "," << best_cost;
 
             for (uint32_t i = 0; i < N_ADVERSARIES; ++i) {
                 uint32_t adv_base = s_base + EGO_SDIM + i * ADVERSARY_SDIM;

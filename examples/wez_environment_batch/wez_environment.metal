@@ -10,6 +10,11 @@ struct ModelParams {
 
     // Adversary parameters
     float adv_v_max;
+    float adv_fire_prob_max;
+    float adv_max_range;
+    float adv_min_range;
+    float adv_k_gain;
+    float adv_capture_radius;
     int adv_max_steps;
     int num_adversaries;    // number of adversaries < 32
 };
@@ -23,7 +28,6 @@ struct CostParams {
     float control_weight;
 
     // Adversary parameters
-    float collision_radius;
     float adv_collision_weight;
     float adv_dist_weight;
 };
@@ -35,6 +39,7 @@ struct Adversary {
     float v;
     uint16_t steps_since_active;
     bool active;
+    bool terminal;
 };
 
 struct AgentStateView {
@@ -42,6 +47,7 @@ struct AgentStateView {
     thread float& y;
     thread float& theta;
     thread float& v;
+    thread bool& captured;
     thread Adversary* adversaries;
 
     AgentStateView(thread uint8_t* raw) :
@@ -49,7 +55,8 @@ struct AgentStateView {
         y(*(thread float*)(raw + 4)),
         theta(*(thread float*)(raw + 8)),
         v(*(thread float*)(raw + 12)),
-        adversaries((thread Adversary*)(raw + 16)) {}
+        captured(*(thread bool*)(raw + 16)),
+        adversaries((thread Adversary*)(raw + 20)) {}
 };
 
 struct ConstAgentStateView {
@@ -69,7 +76,7 @@ struct ConstAgentStateView {
 
 // Validation Logic to ensure everything stays in sync
 static_assert(sizeof(Adversary) == 20, "Adversary size unexpected");
-static_assert(sizeof(AgentStateView) == 40, "AgentStateView should only be a pointer/reference container");
+static_assert(sizeof(AgentStateView) == 48, "AgentStateView should only be a pointer/reference container");
 
 // Ego Dynamics: Kinematic Bicycle Model / Non-holonomic vehicle
 // Adversary Dynamics: Pure-pursuit (non-holonomic), constant velocity
@@ -106,6 +113,12 @@ void mppi_dynamics(
             float dx = state.x - adv.x;
             float dy = state.y - adv.y;
             float target_theta = atan2(dy, dx);
+
+            // Check if captured
+            float d2 = dx*dx + dy*dy;
+            if (d2 < params->adv_capture_radius * params->adv_capture_radius) {
+                state.captured = true;
+            }
             
             // Normalize angle error to [-pi, pi]
             float pi = 3.1415926535f;
@@ -113,7 +126,7 @@ void mppi_dynamics(
             if (error < 0) error += 2.0f * pi;
             error -= pi;
             
-            float k = 2.0f; // steering gain
+            float k = params->adv_k_gain; // steering gain
             float adv_omega = k * error;
             
             // Non-holonomic dynamics
@@ -127,8 +140,9 @@ void mppi_dynamics(
 
             if (state.adversaries[i].steps_since_active > params->adv_max_steps) {
                 state.adversaries[i].active = false;
+                state.adversaries[i].terminal = true;
             }
-        } else {
+        } else if (!state.adversaries[i].terminal) {
             // Probabilistically activate WEZ
             float dx = state.x - state.adversaries[i].x;
             float dy = state.y - state.adversaries[i].y;
@@ -136,14 +150,24 @@ void mppi_dynamics(
             
             // Activation threshold logic (example: more likely as ego gets closer)
             // Assumes max range of 5.0 for demonstration, easily parametrized later.
-            float max_range = 5.0f; 
-            if (dist < max_range) {
+            if (dist < params->adv_max_range) {
+                // Linear probability scaling: adv_fire_prob_max when dist <= adv_min_range, 
+                // scaling down to 0 at adv_max_range.
+                float p = params->adv_fire_prob_max;
+                if (dist > params->adv_min_range) {
+                    float range_delta = params->adv_max_range - params->adv_min_range;
+                    if (range_delta > 1e-6f) { // Avoid division by zero
+                        p *= (params->adv_max_range - dist) / range_delta;
+                    } else {
+                        p = 0.0f; // if max <= min, prob is 0 outside min
+                    }
+                }
+
                 // Ensure unique stream for each WEZ agent using offset
                 uint2 wez_ctr = uint2(rng_counter.x, rng_counter.y + 0x1000 + i); 
                 float u = uint_to_01(philox2x32_10(wez_ctr, rng_seed).x);
                 
-                // firing probability: 10% chance per step. This can be more complex.
-                if (u < 0.1f) {
+                if (u < p) {
                     state.adversaries[i].active = true;
                     state.adversaries[i].steps_since_active = 0;
                 }
@@ -192,7 +216,7 @@ float mppi_stage_cost(
             float dist_to_adv2 = d_adv_x*d_adv_x + d_adv_y*d_adv_y;
 
             // Gaussian collision cost
-            float r2 = params->collision_radius * params->collision_radius + 1e-6f;
+            float r2 = model_params->adv_capture_radius * model_params->adv_capture_radius + 1e-6f;
             cost += params->adv_collision_weight * exp(-dist_to_adv2 / r2);
         }
     }
