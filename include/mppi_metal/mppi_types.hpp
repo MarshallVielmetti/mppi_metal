@@ -171,4 +171,19 @@ struct SimulationResults {
 	uint32_t num_steps = 0;
 };
 
+// ---------------------------------------------------------------------------
+// Batched multi-agent simulation outputs
+// ---------------------------------------------------------------------------
+
+/// Results buffer for simulate_batch().
+/// All output arrays are contiguous and indexed as:
+///   [agent_idx * num_steps * dim + step * dim + element]
+struct BatchSimulationResults {
+	float* states_out = nullptr;     // [num_agents * num_steps * state_dim]
+	float* controls_out = nullptr;   // [num_agents * num_steps * control_dim]
+	float* costs_out = nullptr;      // [num_agents * num_steps]
+	uint32_t num_agents = 0;
+	uint32_t num_steps = 0;
+};
+
 }  // namespace mppi_metal

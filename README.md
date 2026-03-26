@@ -320,6 +320,42 @@ Input:  0 1 2 3
 Output: 0.25 1.25 2.25 3.25
 ```
 
+### Batched multi-agent simulation
+
+`simulate_batch(...)` runs N independent MPPI agents in a single GPU dispatch.
+All agents share the same dynamics/cost functions and parameters but start from
+different initial states and use independent RNG seeds.
+
+```cpp
+struct BatchSimulationResults {
+	float* states_out = nullptr;     // [num_agents * num_steps * state_dim]
+	float* controls_out = nullptr;   // [num_agents * num_steps * control_dim]
+	float* costs_out = nullptr;      // [num_agents * num_steps]
+	uint32_t num_agents = 0;
+	uint32_t num_steps = 0;
+};
+
+bool simulate_batch(
+	uint32_t num_agents,
+	uint32_t num_steps,
+	const float* x0_packed,        // [num_agents * state_dim]
+	const BatchSimulationResults& results,
+	std::string* error = nullptr
+);
+```
+
+**Memory layout**: All buffers are contiguous and indexed as
+`[agent_idx * num_steps * dim + step * dim + element]`.
+
+**RNG independence**: Each agent derives its Philox key as `base_seed + agent_idx`.
+Agent 0 produces identical noise to the single-agent `simulate()` path, preserving
+backward compatibility for N=1.
+
+**GPU dispatch**: The batch kernels use 2D grid dispatches:
+- Rollout: `(sample_count, num_agents)` threads.
+- Weights: `num_agents` threadgroups (one per agent).
+- Reduce / Propagate: `(horizon * control_dim, num_agents)` threads.
+
 ## Next for MPPI
 
 1. Implement this contract in headers/source.

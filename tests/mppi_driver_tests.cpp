@@ -756,6 +756,113 @@ void test_simulate_multi_step_parity() {
 	expect_true(match, "Multi-step simulate() should exactly match N iterations of step()");
 }
 
+void test_simulate_batch_parity() {
+	// Verify that simulate_batch with N=1 produces identical results
+	// to the single-agent simulate() path.
+	auto driver1 = make_initialized_driver({}, "mppi_stage_cost");
+	auto driver2 = make_initialized_driver({}, "mppi_stage_cost");
+
+	const uint32_t T = 5;
+	const uint32_t H = 10, C = 2, Sdim = 4;
+
+	std::vector<float> x0 = {1.0f, 1.0f, 0.0f, 0.0f};
+
+	// Single-agent simulate()
+	std::vector<float> states1(T * Sdim);
+	std::vector<float> controls1(T * C);
+	std::vector<float> costs1(T);
+	mppi_metal::SimulationResults results1;
+	results1.states_out = states1.data();
+	results1.controls_out = controls1.data();
+	results1.costs_out = costs1.data();
+	results1.num_steps = T;
+
+	mppi_metal::StepInputs inputs1;
+	inputs1.x0 = {x0.data(), Sdim};
+	std::string err;
+	bool ok1 = driver1.simulate(T, inputs1, results1, &err);
+	expect_true(ok1, "simulate() should succeed: " + err);
+
+	// Batch simulate with N=1
+	std::vector<float> states2(1 * T * Sdim);
+	std::vector<float> controls2(1 * T * C);
+	std::vector<float> costs2(1 * T);
+	mppi_metal::BatchSimulationResults results2;
+	results2.states_out = states2.data();
+	results2.controls_out = controls2.data();
+	results2.costs_out = costs2.data();
+	results2.num_agents = 1;
+	results2.num_steps = T;
+
+	ok1 = driver2.simulate_batch(1, T, x0.data(), results2, &err);
+	expect_true(ok1, "simulate_batch(N=1) should succeed: " + err);
+
+	bool match = true;
+	for (uint32_t i = 0; i < T; ++i) {
+		for (uint32_t d = 0; d < Sdim; ++d) {
+			if (std::abs(states1[i*Sdim + d] - states2[i*Sdim + d]) > 1e-4f) match = false;
+		}
+		for (uint32_t d = 0; d < C; ++d) {
+			if (std::abs(controls1[i*C + d] - controls2[i*C + d]) > 1e-4f) match = false;
+		}
+		if (std::abs(costs1[i] - costs2[i]) > 1e-4f) match = false;
+	}
+	expect_true(match, "simulate_batch(N=1) should match simulate()");
+}
+
+void test_simulate_batch_multi_agent() {
+	// Verify N=4 agents starting at different positions produce
+	// distinct trajectories with valid results.
+	auto driver = make_initialized_driver({}, "mppi_stage_cost");
+
+	const uint32_t N = 4;
+	const uint32_t T = 5;
+	const uint32_t H = 10, C = 2, Sdim = 4;
+
+	// 4 agents at different positions.
+	std::vector<float> x0_packed = {
+		1.0f,  1.0f, 0.0f, 0.0f,   // agent 0
+		-1.0f, 1.0f, 0.0f, 0.0f,   // agent 1
+		1.0f, -1.0f, 0.0f, 0.0f,   // agent 2
+		-1.0f,-1.0f, 0.0f, 0.0f    // agent 3
+	};
+
+	std::vector<float> states(N * T * Sdim);
+	std::vector<float> controls(N * T * C);
+	std::vector<float> costs(N * T);
+	mppi_metal::BatchSimulationResults results;
+	results.states_out = states.data();
+	results.controls_out = controls.data();
+	results.costs_out = costs.data();
+	results.num_agents = N;
+	results.num_steps = T;
+
+	std::string err;
+	bool ok = driver.simulate_batch(N, T, x0_packed.data(), results, &err);
+	expect_true(ok, "simulate_batch(N=4) should succeed: " + err);
+
+	// Verify agents have distinct initial states in history.
+	bool distinct = true;
+	for (uint32_t a = 1; a < N; ++a) {
+		bool same = true;
+		for (uint32_t d = 0; d < Sdim; ++d) {
+			if (states[a * T * Sdim + d] != states[0 * T * Sdim + d]) {
+				same = false;
+				break;
+			}
+		}
+		if (same) { distinct = false; break; }
+	}
+	expect_true(distinct, "Agents should have distinct initial states");
+
+	// Verify all costs are positive.
+	bool valid_costs = true;
+	for (uint32_t i = 0; i < N * T; ++i) {
+		if (costs[i] <= 0.0f) { valid_costs = false; break; }
+	}
+	expect_true(valid_costs, "All batch costs should be > 0");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -810,6 +917,8 @@ int main() {
 	test_step_mppi_moves_toward_origin();
 	test_step_rng_determinism();
 	test_simulate_multi_step_parity();
+	test_simulate_batch_parity();
+	test_simulate_batch_multi_agent();
 
 	std::cout << "\n" << g_pass << " passed, " << g_fail << " failed.\n";
 	return g_fail > 0 ? 1 : 0;

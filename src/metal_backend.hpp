@@ -82,6 +82,23 @@ public:
 		std::string* error = nullptr
 	);
 
+	/// Dispatch a batched multi-agent simulation on the GPU.
+	/// All N agents share the same pipeline/params but have independent
+	/// initial states and RNG seeds.
+	bool dispatch_batch_simulation(
+		uint32_t num_agents,
+		uint32_t num_steps,
+		const DriverConfig& config,
+		uint64_t start_step_index,
+		const float* x0_packed,
+		const float* u_nominal_packed,
+		const ControlNoiseConfig& noise,
+		const ByteView& model_params,
+		const ByteView& cost_params,
+		const BatchSimulationResults& results,
+		std::string* error = nullptr
+	);
+
 	/// Release GPU resources and reset internal state.
 	bool reset(std::string* error = nullptr);
 

@@ -50,6 +50,16 @@ struct MetalBackend::Impl {
   id<MTLComputePipelineState> propagate_pipeline = nil;
   id<MTLVisibleFunctionTable> propagate_dynamics_table = nil;
 
+  // Batch pipeline states
+  id<MTLComputePipelineState> rollout_batch_pipeline = nil;
+  id<MTLVisibleFunctionTable> batch_dynamics_table = nil;
+  id<MTLVisibleFunctionTable> batch_stage_cost_table = nil;
+  id<MTLVisibleFunctionTable> batch_terminal_cost_table = nil;
+  id<MTLComputePipelineState> weights_batch_pipeline = nil;
+  id<MTLComputePipelineState> reduce_batch_pipeline = nil;
+  id<MTLComputePipelineState> propagate_batch_pipeline = nil;
+  id<MTLVisibleFunctionTable> batch_propagate_dynamics_table = nil;
+
   id<MTLBuffer> diagnostics_buf = nil;
 
   id<MTLLibrary> library_metallib = nil;
@@ -77,10 +87,71 @@ struct MetalBackend::Impl {
   uint32_t allocated_sdim = 0;
   uint32_t allocated_num_steps = 0;
 
+  // Batch scratchpad buffers (separate from single-agent)
+  id<MTLBuffer> batch_x0_buf = nil;
+  id<MTLBuffer> batch_u_nom_buf = nil;
+  id<MTLBuffer> batch_costs_buf = nil;
+  id<MTLBuffer> batch_weights_buf = nil;
+  id<MTLBuffer> batch_u_out_buf = nil;
+  id<MTLBuffer> batch_diag_buf = nil;
+  id<MTLBuffer> batch_his_state_buf = nil;
+  id<MTLBuffer> batch_his_ctrl_buf = nil;
+  id<MTLBuffer> batch_his_cost_buf = nil;
+  uint32_t batch_alloc_N = 0;
+  uint32_t batch_alloc_S = 0;
+  uint32_t batch_alloc_H = 0;
+  uint32_t batch_alloc_cdim = 0;
+  uint32_t batch_alloc_sdim = 0;
+  uint32_t batch_alloc_num_steps = 0;
+
   NSUInteger rollout_max_tpg = 0;
   NSUInteger reduce_max_tpg = 0;
   uint32_t rng_seed = 0;
   bool initialized = false;
+
+  void ensure_batch_scratchpad(const DriverConfig &config, uint32_t num_agents,
+                               uint32_t num_steps) {
+    const uint32_t S = config.sample_count;
+    const uint32_t H = config.horizon;
+    const uint32_t cdim = config.control_dim;
+    const uint32_t sdim = config.state_dim;
+    const uint32_t N = num_agents;
+
+    bool changed = (batch_alloc_N != N) || (batch_alloc_S != S) ||
+                   (batch_alloc_H != H) || (batch_alloc_cdim != cdim) ||
+                   (batch_alloc_sdim != sdim) ||
+                   (batch_alloc_num_steps != num_steps);
+    if (!changed) return;
+
+    id<MTLDevice> dev = device;
+    const size_t seq_len = static_cast<size_t>(H) * cdim;
+
+    batch_x0_buf = [dev newBufferWithLength:N * sdim * sizeof(float)
+                                    options:MTLResourceStorageModeShared];
+    batch_u_nom_buf = [dev newBufferWithLength:N * seq_len * sizeof(float)
+                                       options:MTLResourceStorageModeShared];
+    batch_costs_buf = [dev newBufferWithLength:N * S * sizeof(float)
+                                       options:MTLResourceStorageModeShared];
+    batch_weights_buf = [dev newBufferWithLength:N * S * sizeof(float)
+                                         options:MTLResourceStorageModeShared];
+    batch_u_out_buf = [dev newBufferWithLength:N * seq_len * sizeof(float)
+                                       options:MTLResourceStorageModeShared];
+    batch_diag_buf = [dev newBufferWithLength:N * 3 * sizeof(float)
+                                      options:MTLResourceStorageModeShared];
+    batch_his_state_buf = [dev newBufferWithLength:N * num_steps * sdim * sizeof(float)
+                                           options:MTLResourceStorageModeShared];
+    batch_his_ctrl_buf = [dev newBufferWithLength:N * num_steps * cdim * sizeof(float)
+                                          options:MTLResourceStorageModeShared];
+    batch_his_cost_buf = [dev newBufferWithLength:N * num_steps * sizeof(float)
+                                          options:MTLResourceStorageModeShared];
+
+    batch_alloc_N = N;
+    batch_alloc_S = S;
+    batch_alloc_H = H;
+    batch_alloc_cdim = cdim;
+    batch_alloc_sdim = sdim;
+    batch_alloc_num_steps = num_steps;
+  }
 
   void ensure_scratchpad(const DriverConfig &config, uint32_t num_steps) {
     const uint32_t S = config.sample_count;
@@ -361,6 +432,120 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
   impl_->command_queue = [impl_->device newCommandQueue];
   if (impl_->command_queue == nil) {
     set_error(error, "Failed to create command queue.");
+    return false;
+  }
+
+  // ---- Batch kernels ----
+  id<MTLFunction> rollout_batch_fn =
+      [impl_->library_metallib newFunctionWithName:@"mppi_rollout_batch"];
+  id<MTLFunction> weights_batch_fn =
+      [impl_->library_metallib newFunctionWithName:@"mppi_compute_weights_batch"];
+  id<MTLFunction> reduce_batch_fn =
+      [impl_->library_metallib newFunctionWithName:@"mppi_reduce_batch"];
+  id<MTLFunction> propagate_batch_fn =
+      [impl_->library_metallib newFunctionWithName:@"mppi_propagate_and_shift_batch"];
+
+  if (!rollout_batch_fn || !weights_batch_fn || !reduce_batch_fn ||
+      !propagate_batch_fn) {
+    set_error(error, "Missing batch kernel symbols in metallib.");
+    return false;
+  }
+
+  // Batch rollout pipeline (linked)
+  MTLComputePipelineDescriptor *rollout_batch_desc =
+      [[MTLComputePipelineDescriptor alloc] init];
+  rollout_batch_desc.computeFunction = rollout_batch_fn;
+  rollout_batch_desc.linkedFunctions = linked;
+
+  impl_->rollout_batch_pipeline =
+      [impl_->device newComputePipelineStateWithDescriptor:rollout_batch_desc
+                                                   options:0
+                                                reflection:nil
+                                                     error:&ns_err];
+  if (impl_->rollout_batch_pipeline == nil) {
+    set_error(error, "Failed to create batch rollout pipeline: " +
+                         to_std_string(ns_err.localizedDescription));
+    return false;
+  }
+
+  // Batch weights pipeline (no linked functions)
+  impl_->weights_batch_pipeline =
+      [impl_->device newComputePipelineStateWithFunction:weights_batch_fn
+                                                   error:&ns_err];
+  if (impl_->weights_batch_pipeline == nil) {
+    set_error(error, "Failed to create batch weights pipeline: " +
+                         to_std_string(ns_err.localizedDescription));
+    return false;
+  }
+
+  // Batch reduce pipeline (no linked functions)
+  impl_->reduce_batch_pipeline =
+      [impl_->device newComputePipelineStateWithFunction:reduce_batch_fn
+                                                   error:&ns_err];
+  if (impl_->reduce_batch_pipeline == nil) {
+    set_error(error, "Failed to create batch reduce pipeline: " +
+                         to_std_string(ns_err.localizedDescription));
+    return false;
+  }
+
+  // Batch propagate pipeline (linked)
+  MTLComputePipelineDescriptor *propagate_batch_desc =
+      [[MTLComputePipelineDescriptor alloc] init];
+  propagate_batch_desc.computeFunction = propagate_batch_fn;
+  propagate_batch_desc.linkedFunctions = linked;
+
+  impl_->propagate_batch_pipeline =
+      [impl_->device newComputePipelineStateWithDescriptor:propagate_batch_desc
+                                                   options:0
+                                                reflection:nil
+                                                     error:&ns_err];
+  if (impl_->propagate_batch_pipeline == nil) {
+    set_error(error, "Failed to create batch propagate pipeline: " +
+                         to_std_string(ns_err.localizedDescription));
+    return false;
+  }
+
+  // Batch visible function tables for rollout
+  auto make_batch_rollout_table = [&](id<MTLFunction> fn) -> id<MTLVisibleFunctionTable> {
+    MTLVisibleFunctionTableDescriptor *td =
+        [[MTLVisibleFunctionTableDescriptor alloc] init];
+    td.functionCount = 1;
+    id<MTLVisibleFunctionTable> table =
+        [impl_->rollout_batch_pipeline newVisibleFunctionTableWithDescriptor:td];
+    if (table != nil) {
+      id<MTLFunctionHandle> handle =
+          [impl_->rollout_batch_pipeline functionHandleWithFunction:fn];
+      if (handle != nil)
+        [table setFunction:handle atIndex:0];
+    }
+    return table;
+  };
+
+  impl_->batch_dynamics_table = make_batch_rollout_table(dynamics_fn);
+  impl_->batch_stage_cost_table = make_batch_rollout_table(stage_cost_fn);
+  impl_->batch_terminal_cost_table = make_batch_rollout_table(terminal_cost_fn);
+
+  if (!impl_->batch_dynamics_table || !impl_->batch_stage_cost_table ||
+      !impl_->batch_terminal_cost_table) {
+    set_error(error, "Failed to create batch visible function tables.");
+    return false;
+  }
+
+  // Batch visible function table for propagate
+  MTLVisibleFunctionTableDescriptor *td_batch_prop =
+      [[MTLVisibleFunctionTableDescriptor alloc] init];
+  td_batch_prop.functionCount = 1;
+  impl_->batch_propagate_dynamics_table =
+      [impl_->propagate_batch_pipeline newVisibleFunctionTableWithDescriptor:td_batch_prop];
+  if (impl_->batch_propagate_dynamics_table != nil) {
+    id<MTLFunctionHandle> handle =
+        [impl_->propagate_batch_pipeline functionHandleWithFunction:dynamics_fn];
+    if (handle != nil)
+      [impl_->batch_propagate_dynamics_table setFunction:handle atIndex:0];
+  }
+
+  if (!impl_->batch_propagate_dynamics_table) {
+    set_error(error, "Failed to create batch propagate dynamics table.");
     return false;
   }
 
@@ -729,6 +914,181 @@ bool MetalBackend::dispatch_simulation(
   if (results.costs_out)
     std::memcpy(results.costs_out, impl_->his_cost_buf.contents,
                 num_steps * sizeof(float));
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// dispatch_batch_simulation
+// ---------------------------------------------------------------------------
+
+bool MetalBackend::dispatch_batch_simulation(
+    uint32_t num_agents, uint32_t num_steps, const DriverConfig &config,
+    uint64_t start_step_index, const float *x0_packed,
+    const float *u_nominal_packed, const ControlNoiseConfig &noise,
+    const ByteView &model_params, const ByteView &cost_params,
+    const BatchSimulationResults &results, std::string *error) {
+  if (!impl_->initialized) {
+    set_error(error, "MetalBackend is not initialized.");
+    return false;
+  }
+
+  const uint32_t N = num_agents;
+  const uint32_t S = config.sample_count;
+  const uint32_t H = config.horizon;
+  const uint32_t sdim = config.state_dim;
+  const uint32_t cdim = config.control_dim;
+  const size_t seq_len = static_cast<size_t>(H) * cdim;
+
+  impl_->ensure_scratchpad(config, 0);
+  impl_->ensure_batch_scratchpad(config, N, num_steps);
+
+  // Upload packed data into batch buffers.
+  std::memcpy(impl_->batch_x0_buf.contents, x0_packed,
+              N * sdim * sizeof(float));
+  std::memcpy(impl_->batch_u_nom_buf.contents, u_nominal_packed,
+              N * seq_len * sizeof(float));
+  std::memcpy(impl_->sigma_buf.contents, noise.sigma, cdim * sizeof(float));
+  std::memcpy(impl_->umin_buf.contents, config.bounds.u_min,
+              cdim * sizeof(float));
+  std::memcpy(impl_->umax_buf.contents, config.bounds.u_max,
+              cdim * sizeof(float));
+
+  uint32_t seed = impl_->rng_seed;
+  float lambda = config.lambda;
+
+  auto resolve_param_buf = [&](const ByteView &bv,
+                               id<MTLBuffer> bound) -> id<MTLBuffer> {
+    if (bv.bytes > 0 && bv.data != nullptr)
+      return [impl_->device newBufferWithBytes:bv.data
+                                        length:bv.bytes
+                                       options:MTLResourceStorageModeShared];
+    if (bound != nil)
+      return bound;
+    uint8_t z = 0;
+    return [impl_->device newBufferWithBytes:&z
+                                      length:1
+                                     options:MTLResourceStorageModeShared];
+  };
+  id<MTLBuffer> mp_buf =
+      resolve_param_buf(model_params, impl_->model_params_buffer);
+  id<MTLBuffer> cp_buf =
+      resolve_param_buf(cost_params, impl_->cost_params_buffer);
+
+  id<MTLCommandBuffer> cmd_buf = [impl_->command_queue commandBuffer];
+  id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+
+  NSUInteger rollout_tpg = std::min<NSUInteger>(
+      impl_->rollout_batch_pipeline.maxTotalThreadsPerThreadgroup, 256);
+  NSUInteger weights_tpg = std::min<NSUInteger>(
+      impl_->weights_batch_pipeline.maxTotalThreadsPerThreadgroup, 1024);
+  NSUInteger reduce_tpg = std::min<NSUInteger>(
+      impl_->reduce_batch_pipeline.maxTotalThreadsPerThreadgroup, 256);
+  NSUInteger propagate_tpg = std::min<NSUInteger>(
+      impl_->propagate_batch_pipeline.maxTotalThreadsPerThreadgroup, 256);
+
+  for (uint32_t step = 0; step < num_steps; step++) {
+    uint32_t step_idx32 = static_cast<uint32_t>(start_step_index + step);
+
+    // ---- Pass 1: Batch Rollout ----
+    [enc setComputePipelineState:impl_->rollout_batch_pipeline];
+    [enc setBuffer:impl_->batch_x0_buf offset:0 atIndex:0];
+    [enc setBuffer:impl_->batch_u_nom_buf offset:0 atIndex:1];
+    [enc setBuffer:mp_buf offset:0 atIndex:2];
+    [enc setBuffer:cp_buf offset:0 atIndex:3];
+    [enc setBuffer:impl_->batch_costs_buf offset:0 atIndex:4];
+    [enc setBytes:&sdim length:sizeof(uint32_t) atIndex:5];
+    [enc setBytes:&cdim length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&H length:sizeof(uint32_t) atIndex:7];
+    [enc setBytes:&S length:sizeof(uint32_t) atIndex:8];
+    [enc setBuffer:impl_->umin_buf offset:0 atIndex:9];
+    [enc setBuffer:impl_->umax_buf offset:0 atIndex:10];
+    [enc setVisibleFunctionTable:impl_->batch_dynamics_table atBufferIndex:11];
+    [enc setVisibleFunctionTable:impl_->batch_stage_cost_table
+                   atBufferIndex:12];
+    [enc setVisibleFunctionTable:impl_->batch_terminal_cost_table
+                   atBufferIndex:13];
+    [enc setBuffer:impl_->sigma_buf offset:0 atIndex:14];
+    [enc setBytes:&seed length:sizeof(uint32_t) atIndex:15];
+    [enc setBytes:&step_idx32 length:sizeof(uint32_t) atIndex:16];
+    [enc setBytes:&N length:sizeof(uint32_t) atIndex:17];
+    [enc dispatchThreads:MTLSizeMake(S, N, 1)
+        threadsPerThreadgroup:MTLSizeMake(rollout_tpg, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // ---- Pass 2: Batch Weights ----
+    [enc setComputePipelineState:impl_->weights_batch_pipeline];
+    [enc setBuffer:impl_->batch_costs_buf offset:0 atIndex:0];
+    [enc setBuffer:impl_->batch_weights_buf offset:0 atIndex:1];
+    [enc setBuffer:impl_->batch_diag_buf offset:0 atIndex:2];
+    [enc setBytes:&S length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&lambda length:sizeof(float) atIndex:4];
+    [enc setBytes:&N length:sizeof(uint32_t) atIndex:5];
+    [enc dispatchThreadgroups:MTLSizeMake(N, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(weights_tpg, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // ---- Pass 3: Batch Reduce ----
+    [enc setComputePipelineState:impl_->reduce_batch_pipeline];
+    [enc setBuffer:impl_->batch_weights_buf offset:0 atIndex:0];
+    [enc setBuffer:impl_->batch_u_nom_buf offset:0 atIndex:1];
+    [enc setBuffer:impl_->batch_u_out_buf offset:0 atIndex:2];
+    [enc setBuffer:impl_->sigma_buf offset:0 atIndex:3];
+    [enc setBuffer:impl_->umin_buf offset:0 atIndex:4];
+    [enc setBuffer:impl_->umax_buf offset:0 atIndex:5];
+    [enc setBytes:&S length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&H length:sizeof(uint32_t) atIndex:7];
+    [enc setBytes:&cdim length:sizeof(uint32_t) atIndex:8];
+    [enc setBytes:&seed length:sizeof(uint32_t) atIndex:9];
+    [enc setBytes:&step_idx32 length:sizeof(uint32_t) atIndex:10];
+    [enc setBytes:&N length:sizeof(uint32_t) atIndex:11];
+    [enc dispatchThreads:MTLSizeMake(seq_len, N, 1)
+        threadsPerThreadgroup:MTLSizeMake(reduce_tpg, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // ---- Pass 4: Batch Propagate & Shift ----
+    [enc setComputePipelineState:impl_->propagate_batch_pipeline];
+    [enc setBuffer:impl_->batch_x0_buf offset:0 atIndex:0];
+    [enc setBuffer:impl_->batch_u_nom_buf offset:0 atIndex:1];
+    [enc setBuffer:impl_->batch_u_out_buf offset:0 atIndex:2];
+    [enc setBuffer:impl_->batch_his_state_buf offset:0 atIndex:3];
+    [enc setBuffer:impl_->batch_his_ctrl_buf offset:0 atIndex:4];
+    [enc setBuffer:impl_->batch_his_cost_buf offset:0 atIndex:5];
+    [enc setBuffer:impl_->batch_diag_buf offset:0 atIndex:6];
+    [enc setBuffer:mp_buf offset:0 atIndex:7];
+    [enc setBytes:&sdim length:sizeof(uint32_t) atIndex:8];
+    [enc setBytes:&cdim length:sizeof(uint32_t) atIndex:9];
+    [enc setBytes:&H length:sizeof(uint32_t) atIndex:10];
+    [enc setBytes:&step_idx32 length:sizeof(uint32_t) atIndex:11];
+    [enc setVisibleFunctionTable:impl_->batch_propagate_dynamics_table
+                   atBufferIndex:12];
+    [enc setBytes:&N length:sizeof(uint32_t) atIndex:13];
+    [enc setBytes:&num_steps length:sizeof(uint32_t) atIndex:14];
+    [enc dispatchThreads:MTLSizeMake(seq_len, N, 1)
+        threadsPerThreadgroup:MTLSizeMake(propagate_tpg, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+  }
+
+  [enc endEncoding];
+  [cmd_buf commit];
+  [cmd_buf waitUntilCompleted];
+
+  if (cmd_buf.status == MTLCommandBufferStatusError) {
+    set_error(error, "Batch simulation command buffer failed: " +
+                         to_std_string(cmd_buf.error.localizedDescription));
+    return false;
+  }
+
+  // Read back batch history.
+  if (results.states_out)
+    std::memcpy(results.states_out, impl_->batch_his_state_buf.contents,
+                N * num_steps * sdim * sizeof(float));
+  if (results.controls_out)
+    std::memcpy(results.controls_out, impl_->batch_his_ctrl_buf.contents,
+                N * num_steps * cdim * sizeof(float));
+  if (results.costs_out)
+    std::memcpy(results.costs_out, impl_->batch_his_cost_buf.contents,
+                N * num_steps * sizeof(float));
 
   return true;
 }

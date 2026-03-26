@@ -74,6 +74,22 @@ public:
 		std::string* error = nullptr
 	);
 
+	/// Run a batched multi-agent MPPI simulation on the GPU.
+	/// All N agents share the same dynamics/cost/parameters but start from
+	/// different initial states and use independent RNG seeds.
+	///
+	/// @param num_agents    Number of independent agents to simulate.
+	/// @param num_steps     Number of MPPI control steps per agent.
+	/// @param x0_packed     Packed initial states [num_agents * state_dim].
+	/// @param results       Output buffers sized [num_agents * num_steps * dim].
+	bool simulate_batch(
+		uint32_t num_agents,
+		uint32_t num_steps,
+		const float* x0_packed,
+		const BatchSimulationResults& results,
+		std::string* error = nullptr
+	);
+
 private:
 	class Impl;
 	std::unique_ptr<Impl> impl_;

@@ -139,3 +139,4 @@ endif()
 # ---------------------------------------------------------------------------
 add_subdirectory(examples/nonholonomic_vehicle)
 add_subdirectory(examples/nonholonomic_vehicle_concurrent)
+add_subdirectory(examples/nonholonomic_vehicle_batch)

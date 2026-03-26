@@ -420,6 +420,76 @@ bool MPPIDriver::simulate(
 	return true;
 }
 
+bool MPPIDriver::simulate_batch(
+	uint32_t num_agents,
+	uint32_t num_steps,
+	const float* x0_packed,
+	const BatchSimulationResults& results,
+	std::string* error
+) {
+	auto set_err = [&](const std::string& msg) {
+		if (error != nullptr) {
+			*error = msg;
+		}
+	};
+
+	if (!impl_->initialized) {
+		set_err("Driver is not initialized. Call initialize() first.");
+		return false;
+	}
+
+	if (num_agents == 0) {
+		set_err("num_agents must be > 0.");
+		return false;
+	}
+	if (num_steps == 0) {
+		set_err("num_steps must be > 0.");
+		return false;
+	}
+	if (x0_packed == nullptr) {
+		set_err("x0_packed must not be null.");
+		return false;
+	}
+
+	const auto& cfg = impl_->config;
+
+	if (results.num_agents != num_agents) {
+		set_err("BatchSimulationResults::num_agents mismatch.");
+		return false;
+	}
+	if (results.num_steps != num_steps) {
+		set_err("BatchSimulationResults::num_steps mismatch.");
+		return false;
+	}
+
+	// All agents start with zero nominal controls.
+	const size_t seq_len =
+		static_cast<size_t>(cfg.horizon) * static_cast<size_t>(cfg.control_dim);
+	std::vector<float> u_nominal_packed(
+		static_cast<size_t>(num_agents) * seq_len, 0.0f);
+
+	ByteView active_model_params = impl_->bound_params.model_params;
+	ByteView active_cost_params = impl_->bound_params.cost_params;
+
+	if (!impl_->backend.dispatch_batch_simulation(
+			num_agents,
+			num_steps,
+			cfg,
+			impl_->step_index,
+			x0_packed,
+			u_nominal_packed.data(),
+			cfg.noise,
+			active_model_params,
+			active_cost_params,
+			results,
+			error)) {
+		return false;
+	}
+
+	impl_->step_index += num_steps;
+	return true;
+}
+
 bool MPPIDriver::reset(std::string* error) {
 	// Zero out internal nominal controls and reset step index.
 	// Bound ProblemParams are kept unchanged.
