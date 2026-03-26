@@ -39,19 +39,13 @@ struct MetalBackend::Impl {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> command_queue = nil;
 
-  // Pass 1: rollout pipeline (linked with user callables).
   id<MTLComputePipelineState> rollout_pipeline = nil;
   id<MTLVisibleFunctionTable> dynamics_table = nil;
   id<MTLVisibleFunctionTable> stage_cost_table = nil;
   id<MTLVisibleFunctionTable> terminal_cost_table = nil;
 
-  // Pass 2: weights pipeline.
   id<MTLComputePipelineState> weights_pipeline = nil;
-
-  // Pass 3: reduction pipeline (no linked functions needed).
   id<MTLComputePipelineState> reduce_pipeline = nil;
-
-  // Pass 4: propagation pipeline
   id<MTLComputePipelineState> propagate_pipeline = nil;
   id<MTLVisibleFunctionTable> propagate_dynamics_table = nil;
 
@@ -61,10 +55,66 @@ struct MetalBackend::Impl {
   id<MTLLibrary> user_metallib = nil;
   id<MTLBuffer> model_params_buffer = nil;
   id<MTLBuffer> cost_params_buffer = nil;
+
+  // Persistent shared scratchpad buffers
+  id<MTLBuffer> u_nom_buf = nil;
+  id<MTLBuffer> sigma_buf = nil;
+  id<MTLBuffer> umin_buf = nil;
+  id<MTLBuffer> umax_buf = nil;
+  id<MTLBuffer> costs_buf = nil;
+  id<MTLBuffer> weights_buf = nil;
+  id<MTLBuffer> u_out_buf = nil;
+  id<MTLBuffer> x0_buf = nil;
+
+  id<MTLBuffer> his_state_buf = nil;
+  id<MTLBuffer> his_ctrl_buf = nil;
+  id<MTLBuffer> his_cost_buf = nil;
+
+  uint32_t allocated_S = 0;
+  uint32_t allocated_H = 0;
+  uint32_t allocated_cdim = 0;
+  uint32_t allocated_sdim = 0;
+  uint32_t allocated_num_steps = 0;
+
   NSUInteger rollout_max_tpg = 0;
   NSUInteger reduce_max_tpg = 0;
   uint32_t rng_seed = 0;
   bool initialized = false;
+
+  void ensure_scratchpad(const DriverConfig& config, uint32_t num_steps) {
+    const uint32_t S = config.sample_count;
+    const uint32_t H = config.horizon;
+    const uint32_t cdim = config.control_dim;
+    const uint32_t sdim = config.state_dim;
+    
+    bool size_changed = (allocated_S != S) || (allocated_H != H) || 
+                        (allocated_cdim != cdim) || (allocated_sdim != sdim);
+
+    id<MTLDevice> dev = device;
+    if (size_changed) {
+        const size_t seq_len = static_cast<size_t>(H) * cdim;
+        u_nom_buf = [dev newBufferWithLength:seq_len * sizeof(float) options:MTLResourceStorageModeShared];
+        sigma_buf = [dev newBufferWithLength:cdim * sizeof(float) options:MTLResourceStorageModeShared];
+        umin_buf  = [dev newBufferWithLength:cdim * sizeof(float) options:MTLResourceStorageModeShared];
+        umax_buf  = [dev newBufferWithLength:cdim * sizeof(float) options:MTLResourceStorageModeShared];
+        costs_buf = [dev newBufferWithLength:S * sizeof(float) options:MTLResourceStorageModeShared];
+        weights_buf = [dev newBufferWithLength:S * sizeof(float) options:MTLResourceStorageModeShared];
+        u_out_buf = [dev newBufferWithLength:seq_len * sizeof(float) options:MTLResourceStorageModeShared];
+        x0_buf    = [dev newBufferWithLength:sdim * sizeof(float) options:MTLResourceStorageModeShared];
+
+        allocated_S = S;
+        allocated_H = H;
+        allocated_cdim = cdim;
+        allocated_sdim = sdim;
+    }
+
+    if (num_steps > 0 && allocated_num_steps != num_steps) {
+        his_state_buf = [dev newBufferWithLength:num_steps * sdim * sizeof(float) options:MTLResourceStorageModeShared];
+        his_ctrl_buf  = [dev newBufferWithLength:num_steps * cdim * sizeof(float) options:MTLResourceStorageModeShared];
+        his_cost_buf  = [dev newBufferWithLength:num_steps * sizeof(float) options:MTLResourceStorageModeShared];
+        allocated_num_steps = num_steps;
+    }
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -357,40 +407,17 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   const uint32_t cdim = config.control_dim;
   const size_t seq_len = static_cast<size_t>(H) * cdim;
 
-  // ---- Shared buffers (used by both passes) ----
-  id<MTLBuffer> u_nom_buf =
-      [impl_->device newBufferWithBytes:u_nominal
-                                length:seq_len * sizeof(float)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> sigma_buf =
-      [impl_->device newBufferWithBytes:noise.sigma
-                                length:cdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> umin_buf =
-      [impl_->device newBufferWithBytes:config.bounds.u_min
-                                length:cdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> umax_buf =
-      [impl_->device newBufferWithBytes:config.bounds.u_max
-                                length:cdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
-  uint32_t seed = impl_->rng_seed;
-  id<MTLBuffer> seed_buf =
-      [impl_->device newBufferWithBytes:&seed length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-  uint32_t step_idx32 = static_cast<uint32_t>(step_index);
-  id<MTLBuffer> step_buf =
-      [impl_->device newBufferWithBytes:&step_idx32 length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> lambda_buf =
-      [impl_->device newBufferWithBytes:&config.lambda length:sizeof(float)
-                               options:MTLResourceStorageModeShared];
+  impl_->ensure_scratchpad(config, 0);
 
-  // ---- Pass 1: Rollout ----
-  id<MTLBuffer> x0_buf =
-      [impl_->device newBufferWithBytes:x0
-                                length:sdim * sizeof(float)
-                               options:MTLResourceStorageModeShared];
+  std::memcpy(impl_->u_nom_buf.contents, u_nominal, seq_len * sizeof(float));
+  std::memcpy(impl_->sigma_buf.contents, noise.sigma, cdim * sizeof(float));
+  std::memcpy(impl_->umin_buf.contents, config.bounds.u_min, cdim * sizeof(float));
+  std::memcpy(impl_->umax_buf.contents, config.bounds.u_max, cdim * sizeof(float));
+  std::memcpy(impl_->x0_buf.contents, x0, sdim * sizeof(float));
+
+  uint32_t seed = impl_->rng_seed;
+  uint32_t step_idx32 = static_cast<uint32_t>(step_index);
+  float lambda = config.lambda;
 
   auto resolve_param_buf = [&](const ByteView &bv,
                                id<MTLBuffer> bound) -> id<MTLBuffer> {
@@ -405,47 +432,29 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   id<MTLBuffer> mp_buf = resolve_param_buf(model_params, impl_->model_params_buffer);
   id<MTLBuffer> cp_buf = resolve_param_buf(cost_params, impl_->cost_params_buffer);
 
-  id<MTLBuffer> costs_buf =
-      [impl_->device newBufferWithLength:S * sizeof(float)
-                                options:MTLResourceStorageModeShared];
-
-  // Scalar constant buffers.
-  id<MTLBuffer> sdim_buf =
-      [impl_->device newBufferWithBytes:&sdim length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> cdim_buf =
-      [impl_->device newBufferWithBytes:&cdim length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> horizon_buf =
-      [impl_->device newBufferWithBytes:&H length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-  id<MTLBuffer> sample_buf =
-      [impl_->device newBufferWithBytes:&S length:sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-
   id<MTLCommandBuffer> cmd_buf = [impl_->command_queue commandBuffer];
 
   // Encode rollout.
   {
     id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->rollout_pipeline];
-    [enc setBuffer:x0_buf      offset:0 atIndex:0];
-    [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
-    [enc setBuffer:mp_buf      offset:0 atIndex:2];
-    [enc setBuffer:cp_buf      offset:0 atIndex:3];
-    [enc setBuffer:costs_buf   offset:0 atIndex:4];
-    [enc setBuffer:sdim_buf    offset:0 atIndex:5];
-    [enc setBuffer:cdim_buf    offset:0 atIndex:6];
-    [enc setBuffer:horizon_buf offset:0 atIndex:7];
-    [enc setBuffer:sample_buf  offset:0 atIndex:8];
-    [enc setBuffer:umin_buf    offset:0 atIndex:9];
-    [enc setBuffer:umax_buf    offset:0 atIndex:10];
+    [enc setBuffer:impl_->x0_buf      offset:0 atIndex:0];
+    [enc setBuffer:impl_->u_nom_buf   offset:0 atIndex:1];
+    [enc setBuffer:mp_buf             offset:0 atIndex:2];
+    [enc setBuffer:cp_buf             offset:0 atIndex:3];
+    [enc setBuffer:impl_->costs_buf   offset:0 atIndex:4];
+    [enc setBytes:&sdim               length:sizeof(uint32_t) atIndex:5];
+    [enc setBytes:&cdim               length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&H                  length:sizeof(uint32_t) atIndex:7];
+    [enc setBytes:&S                  length:sizeof(uint32_t) atIndex:8];
+    [enc setBuffer:impl_->umin_buf    offset:0 atIndex:9];
+    [enc setBuffer:impl_->umax_buf    offset:0 atIndex:10];
     [enc setVisibleFunctionTable:impl_->dynamics_table      atBufferIndex:11];
     [enc setVisibleFunctionTable:impl_->stage_cost_table    atBufferIndex:12];
     [enc setVisibleFunctionTable:impl_->terminal_cost_table atBufferIndex:13];
-    [enc setBuffer:sigma_buf   offset:0 atIndex:14];
-    [enc setBuffer:seed_buf    offset:0 atIndex:15];
-    [enc setBuffer:step_buf    offset:0 atIndex:16];
+    [enc setBuffer:impl_->sigma_buf   offset:0 atIndex:14];
+    [enc setBytes:&seed               length:sizeof(uint32_t) atIndex:15];
+    [enc setBytes:&step_idx32         length:sizeof(uint32_t) atIndex:16];
 
     NSUInteger tpg = std::min<NSUInteger>(impl_->rollout_max_tpg, 256);
     [enc dispatchThreads:MTLSizeMake(S, 1, 1)
@@ -454,18 +463,14 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   }
 
   // ---- Pass 2: Weights ----
-  id<MTLBuffer> weights_buf =
-      [impl_->device newBufferWithLength:S * sizeof(float)
-                                options:MTLResourceStorageModeShared];
-
   {
     id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->weights_pipeline];
-    [enc setBuffer:costs_buf offset:0 atIndex:0];
-    [enc setBuffer:weights_buf offset:0 atIndex:1];
-    [enc setBuffer:impl_->diagnostics_buf offset:0 atIndex:2];
-    [enc setBuffer:sample_buf offset:0 atIndex:3];
-    [enc setBuffer:lambda_buf offset:0 atIndex:4];
+    [enc setBuffer:impl_->costs_buf        offset:0 atIndex:0];
+    [enc setBuffer:impl_->weights_buf      offset:0 atIndex:1];
+    [enc setBuffer:impl_->diagnostics_buf  offset:0 atIndex:2];
+    [enc setBytes:&S                       length:sizeof(uint32_t) atIndex:3];
+    [enc setBytes:&lambda                  length:sizeof(float) atIndex:4];
 
     NSUInteger tpg_w = std::min<NSUInteger>(impl_->weights_pipeline.maxTotalThreadsPerThreadgroup, 1024);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
@@ -474,24 +479,20 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   }
 
   // ---- Pass 3: Reduce ----
-  id<MTLBuffer> u_out_buf =
-      [impl_->device newBufferWithLength:seq_len * sizeof(float)
-                                options:MTLResourceStorageModeShared];
-
   {
     id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
     [enc setComputePipelineState:impl_->reduce_pipeline];
-    [enc setBuffer:weights_buf offset:0 atIndex:0];
-    [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
-    [enc setBuffer:u_out_buf   offset:0 atIndex:2];
-    [enc setBuffer:sigma_buf   offset:0 atIndex:3];
-    [enc setBuffer:umin_buf    offset:0 atIndex:4];
-    [enc setBuffer:umax_buf    offset:0 atIndex:5];
-    [enc setBuffer:sample_buf  offset:0 atIndex:6];
-    [enc setBuffer:horizon_buf offset:0 atIndex:7];
-    [enc setBuffer:cdim_buf    offset:0 atIndex:8];
-    [enc setBuffer:seed_buf    offset:0 atIndex:9];
-    [enc setBuffer:step_buf    offset:0 atIndex:10];
+    [enc setBuffer:impl_->weights_buf offset:0 atIndex:0];
+    [enc setBuffer:impl_->u_nom_buf   offset:0 atIndex:1];
+    [enc setBuffer:impl_->u_out_buf   offset:0 atIndex:2];
+    [enc setBuffer:impl_->sigma_buf   offset:0 atIndex:3];
+    [enc setBuffer:impl_->umin_buf    offset:0 atIndex:4];
+    [enc setBuffer:impl_->umax_buf    offset:0 atIndex:5];
+    [enc setBytes:&S                  length:sizeof(uint32_t) atIndex:6];
+    [enc setBytes:&H                  length:sizeof(uint32_t) atIndex:7];
+    [enc setBytes:&cdim               length:sizeof(uint32_t) atIndex:8];
+    [enc setBytes:&seed               length:sizeof(uint32_t) atIndex:9];
+    [enc setBytes:&step_idx32         length:sizeof(uint32_t) atIndex:10];
 
     NSUInteger tpg2 = std::min<NSUInteger>(impl_->reduce_max_tpg, 256);
     [enc dispatchThreads:MTLSizeMake(seq_len, 1, 1)
@@ -518,7 +519,7 @@ bool MetalBackend::dispatch_rollout(const DriverConfig &config,
   }
 
   // ---- Read back updated controls ----
-  std::memcpy(u_out, u_out_buf.contents, seq_len * sizeof(float));
+  std::memcpy(u_out, impl_->u_out_buf.contents, seq_len * sizeof(float));
 
   return true;
 }
@@ -548,25 +549,16 @@ bool MetalBackend::dispatch_simulation(
   const uint32_t cdim = config.control_dim;
   const size_t seq_len = static_cast<size_t>(H) * cdim;
 
-  // Global scalar buffer creation helper
-  auto make_uint = [&](uint32_t val) { return [impl_->device newBufferWithBytes:&val length:sizeof(uint32_t) options:MTLResourceStorageModeShared]; };
-  id<MTLBuffer> sdim_buf = make_uint(sdim);
-  id<MTLBuffer> cdim_buf = make_uint(cdim);
-  id<MTLBuffer> horizon_buf = make_uint(H);
-  id<MTLBuffer> sample_buf = make_uint(S);
+  impl_->ensure_scratchpad(config, num_steps);
+
+  std::memcpy(impl_->u_nom_buf.contents, u_nominal, seq_len * sizeof(float));
+  std::memcpy(impl_->sigma_buf.contents, noise.sigma, cdim * sizeof(float));
+  std::memcpy(impl_->umin_buf.contents, config.bounds.u_min, cdim * sizeof(float));
+  std::memcpy(impl_->umax_buf.contents, config.bounds.u_max, cdim * sizeof(float));
+  std::memcpy(impl_->x0_buf.contents, x0, sdim * sizeof(float));
+
   uint32_t seed = impl_->rng_seed;
-  id<MTLBuffer> seed_buf = [impl_->device newBufferWithBytes:&seed length:sizeof(uint32_t) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> lambda_buf = [impl_->device newBufferWithBytes:&config.lambda length:sizeof(float) options:MTLResourceStorageModeShared];
-
-  id<MTLBuffer> current_x_buf = [impl_->device newBufferWithBytes:x0 length:sdim * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> u_nom_buf = [impl_->device newBufferWithBytes:u_nominal length:seq_len * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> sigma_buf = [impl_->device newBufferWithBytes:noise.sigma length:cdim * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> umin_buf = [impl_->device newBufferWithBytes:config.bounds.u_min length:cdim * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> umax_buf = [impl_->device newBufferWithBytes:config.bounds.u_max length:cdim * sizeof(float) options:MTLResourceStorageModeShared];
-
-  id<MTLBuffer> costs_buf = [impl_->device newBufferWithLength:S * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> weights_buf = [impl_->device newBufferWithLength:S * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> u_out_buf = [impl_->device newBufferWithLength:seq_len * sizeof(float) options:MTLResourceStorageModeShared];
+  float lambda = config.lambda;
 
   auto resolve_param_buf = [&](const ByteView &bv, id<MTLBuffer> bound) -> id<MTLBuffer> {
     if (bv.bytes > 0 && bv.data != nullptr) return [impl_->device newBufferWithBytes:bv.data length:bv.bytes options:MTLResourceStorageModeShared];
@@ -577,86 +569,82 @@ bool MetalBackend::dispatch_simulation(
   id<MTLBuffer> mp_buf = resolve_param_buf(model_params, impl_->model_params_buffer);
   id<MTLBuffer> cp_buf = resolve_param_buf(cost_params, impl_->cost_params_buffer);
 
-  id<MTLBuffer> his_state = nil; if (results.states_out) his_state = [impl_->device newBufferWithLength:num_steps * sdim * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> his_ctrl = nil; if (results.controls_out) his_ctrl = [impl_->device newBufferWithLength:num_steps * cdim * sizeof(float) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> his_cost = nil; if (results.costs_out) his_cost = [impl_->device newBufferWithLength:num_steps * sizeof(float) options:MTLResourceStorageModeShared];
   id<MTLBuffer> dummy = [impl_->device newBufferWithLength:1 options:MTLResourceStorageModeShared];
+  id<MTLBuffer> his_state = impl_->his_state_buf ? impl_->his_state_buf : dummy;
+  id<MTLBuffer> his_ctrl = impl_->his_ctrl_buf ? impl_->his_ctrl_buf : dummy;
+  id<MTLBuffer> his_cost = impl_->his_cost_buf ? impl_->his_cost_buf : dummy;
 
   id<MTLCommandBuffer> cmd_buf = [impl_->command_queue commandBuffer];
 
-  std::vector<id<MTLBuffer>> step_bufs(num_steps);
   for (uint32_t step = 0; step < num_steps; step++) {
       uint32_t step_idx32 = static_cast<uint32_t>(start_step_index + step);
-      step_bufs[step] = make_uint(step_idx32);
-      id<MTLBuffer> cur_step_buf = step_bufs[step];
 
       // Pass 1: Rollout
       id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
       [enc setComputePipelineState:impl_->rollout_pipeline];
-      [enc setBuffer:current_x_buf offset:0 atIndex:0];
-      [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
-      [enc setBuffer:mp_buf      offset:0 atIndex:2];
-      [enc setBuffer:cp_buf      offset:0 atIndex:3];
-      [enc setBuffer:costs_buf   offset:0 atIndex:4];
-      [enc setBuffer:sdim_buf    offset:0 atIndex:5];
-      [enc setBuffer:cdim_buf    offset:0 atIndex:6];
-      [enc setBuffer:horizon_buf offset:0 atIndex:7];
-      [enc setBuffer:sample_buf  offset:0 atIndex:8];
-      [enc setBuffer:umin_buf    offset:0 atIndex:9];
-      [enc setBuffer:umax_buf    offset:0 atIndex:10];
+      [enc setBuffer:impl_->x0_buf        offset:0 atIndex:0];
+      [enc setBuffer:impl_->u_nom_buf     offset:0 atIndex:1];
+      [enc setBuffer:mp_buf               offset:0 atIndex:2];
+      [enc setBuffer:cp_buf               offset:0 atIndex:3];
+      [enc setBuffer:impl_->costs_buf     offset:0 atIndex:4];
+      [enc setBytes:&sdim                 length:sizeof(uint32_t) atIndex:5];
+      [enc setBytes:&cdim                 length:sizeof(uint32_t) atIndex:6];
+      [enc setBytes:&H                    length:sizeof(uint32_t) atIndex:7];
+      [enc setBytes:&S                    length:sizeof(uint32_t) atIndex:8];
+      [enc setBuffer:impl_->umin_buf      offset:0 atIndex:9];
+      [enc setBuffer:impl_->umax_buf      offset:0 atIndex:10];
       [enc setVisibleFunctionTable:impl_->dynamics_table      atBufferIndex:11];
       [enc setVisibleFunctionTable:impl_->stage_cost_table    atBufferIndex:12];
       [enc setVisibleFunctionTable:impl_->terminal_cost_table atBufferIndex:13];
-      [enc setBuffer:sigma_buf   offset:0 atIndex:14];
-      [enc setBuffer:seed_buf    offset:0 atIndex:15];
-      [enc setBuffer:cur_step_buf offset:0 atIndex:16];
+      [enc setBuffer:impl_->sigma_buf     offset:0 atIndex:14];
+      [enc setBytes:&seed                 length:sizeof(uint32_t) atIndex:15];
+      [enc setBytes:&step_idx32           length:sizeof(uint32_t) atIndex:16];
       [enc dispatchThreads:MTLSizeMake(S, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(impl_->rollout_pipeline.maxTotalThreadsPerThreadgroup, 256), 1, 1)];
       [enc endEncoding];
 
       // Pass 2: Weights
       enc = [cmd_buf computeCommandEncoder];
       [enc setComputePipelineState:impl_->weights_pipeline];
-      [enc setBuffer:costs_buf offset:0 atIndex:0];
-      [enc setBuffer:weights_buf offset:0 atIndex:1];
+      [enc setBuffer:impl_->costs_buf       offset:0 atIndex:0];
+      [enc setBuffer:impl_->weights_buf     offset:0 atIndex:1];
       [enc setBuffer:impl_->diagnostics_buf offset:0 atIndex:2];
-      [enc setBuffer:sample_buf offset:0 atIndex:3];
-      [enc setBuffer:lambda_buf offset:0 atIndex:4];
+      [enc setBytes:&S                      length:sizeof(uint32_t) atIndex:3];
+      [enc setBytes:&lambda                 length:sizeof(float) atIndex:4];
       [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(impl_->weights_pipeline.maxTotalThreadsPerThreadgroup, 1024), 1, 1)];
       [enc endEncoding];
 
       // Pass 3: Reduce
       enc = [cmd_buf computeCommandEncoder];
       [enc setComputePipelineState:impl_->reduce_pipeline];
-      [enc setBuffer:weights_buf offset:0 atIndex:0];
-      [enc setBuffer:u_nom_buf   offset:0 atIndex:1];
-      [enc setBuffer:u_out_buf   offset:0 atIndex:2];
-      [enc setBuffer:sigma_buf   offset:0 atIndex:3];
-      [enc setBuffer:umin_buf    offset:0 atIndex:4];
-      [enc setBuffer:umax_buf    offset:0 atIndex:5];
-      [enc setBuffer:sample_buf  offset:0 atIndex:6];
-      [enc setBuffer:horizon_buf offset:0 atIndex:7];
-      [enc setBuffer:cdim_buf    offset:0 atIndex:8];
-      [enc setBuffer:seed_buf    offset:0 atIndex:9];
-      [enc setBuffer:cur_step_buf offset:0 atIndex:10];
+      [enc setBuffer:impl_->weights_buf   offset:0 atIndex:0];
+      [enc setBuffer:impl_->u_nom_buf     offset:0 atIndex:1];
+      [enc setBuffer:impl_->u_out_buf     offset:0 atIndex:2];
+      [enc setBuffer:impl_->sigma_buf     offset:0 atIndex:3];
+      [enc setBuffer:impl_->umin_buf      offset:0 atIndex:4];
+      [enc setBuffer:impl_->umax_buf      offset:0 atIndex:5];
+      [enc setBytes:&S                    length:sizeof(uint32_t) atIndex:6];
+      [enc setBytes:&H                    length:sizeof(uint32_t) atIndex:7];
+      [enc setBytes:&cdim                 length:sizeof(uint32_t) atIndex:8];
+      [enc setBytes:&seed                 length:sizeof(uint32_t) atIndex:9];
+      [enc setBytes:&step_idx32           length:sizeof(uint32_t) atIndex:10];
       [enc dispatchThreads:MTLSizeMake(seq_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(impl_->reduce_pipeline.maxTotalThreadsPerThreadgroup, 256), 1, 1)];
       [enc endEncoding];
 
       // Pass 4: Propagate & Shift
       enc = [cmd_buf computeCommandEncoder];
       [enc setComputePipelineState:impl_->propagate_pipeline];
-      [enc setBuffer:current_x_buf offset:0 atIndex:0];
-      [enc setBuffer:u_nom_buf     offset:0 atIndex:1];
-      [enc setBuffer:u_out_buf     offset:0 atIndex:2];
-      [enc setBuffer:his_state?his_state:dummy offset:0 atIndex:3];
-      [enc setBuffer:his_ctrl?his_ctrl:dummy offset:0 atIndex:4];
-      [enc setBuffer:his_cost?his_cost:dummy offset:0 atIndex:5];
+      [enc setBuffer:impl_->x0_buf        offset:0 atIndex:0];
+      [enc setBuffer:impl_->u_nom_buf     offset:0 atIndex:1];
+      [enc setBuffer:impl_->u_out_buf     offset:0 atIndex:2];
+      [enc setBuffer:his_state            offset:0 atIndex:3];
+      [enc setBuffer:his_ctrl             offset:0 atIndex:4];
+      [enc setBuffer:his_cost             offset:0 atIndex:5];
       [enc setBuffer:impl_->diagnostics_buf offset:0 atIndex:6];
-      [enc setBuffer:mp_buf        offset:0 atIndex:7];
-      [enc setBuffer:sdim_buf      offset:0 atIndex:8];
-      [enc setBuffer:cdim_buf      offset:0 atIndex:9];
-      [enc setBuffer:horizon_buf   offset:0 atIndex:10];
-      id<MTLBuffer> step_idx = make_uint(step);
-      [enc setBuffer:step_idx      offset:0 atIndex:11];
+      [enc setBuffer:mp_buf               offset:0 atIndex:7];
+      [enc setBytes:&sdim                 length:sizeof(uint32_t) atIndex:8];
+      [enc setBytes:&cdim                 length:sizeof(uint32_t) atIndex:9];
+      [enc setBytes:&H                    length:sizeof(uint32_t) atIndex:10];
+      [enc setBytes:&step_idx32           length:sizeof(uint32_t) atIndex:11];
       [enc setVisibleFunctionTable:impl_->propagate_dynamics_table atBufferIndex:12];
       [enc dispatchThreads:MTLSizeMake(seq_len, 1, 1) threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(impl_->propagate_pipeline.maxTotalThreadsPerThreadgroup, 256), 1, 1)];
       [enc endEncoding];
@@ -671,9 +659,9 @@ bool MetalBackend::dispatch_simulation(
   }
 
   // Read back history
-  if (results.states_out) std::memcpy(results.states_out, his_state.contents, num_steps * sdim * sizeof(float));
-  if (results.controls_out) std::memcpy(results.controls_out, his_ctrl.contents, num_steps * cdim * sizeof(float));
-  if (results.costs_out) std::memcpy(results.costs_out, his_cost.contents, num_steps * sizeof(float));
+  if (results.states_out) std::memcpy(results.states_out, impl_->his_state_buf.contents, num_steps * sdim * sizeof(float));
+  if (results.controls_out) std::memcpy(results.controls_out, impl_->his_ctrl_buf.contents, num_steps * cdim * sizeof(float));
+  if (results.costs_out) std::memcpy(results.costs_out, impl_->his_cost_buf.contents, num_steps * sizeof(float));
 
   return true;
 }
