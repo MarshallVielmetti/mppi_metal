@@ -29,8 +29,8 @@ struct CostParams {
 };
 
 // Ego Dynamics: Kinematic Bicycle Model / Non-holonomic vehicle
-// Adversary Dynamics: Pure-pursuit, constant velocity
-// State: [x, y, theta, v, x_adv_1, y_adv_1, c_adv_1, x_adv_2, y_adv_2, c_adv_2...]
+// Adversary Dynamics: Pure-pursuit (non-holonomic), constant velocity
+// State: [x, y, theta, v, x_adv_1, y_adv_1, th_adv_1, v_adv_1, x_adv_2, y_adv_2, th_adv_2, v_adv_2...]
 // Control: [a, omega]
 [[visible]]
 void mppi_dynamics(
@@ -54,24 +54,31 @@ void mppi_dynamics(
 
     // Update adversaries
     for (int i = 0; i < params->num_adversaries; ++i) {
-        if ((params->active_adversaries >> i) & 1 && state[4 + i * 2 + 2] < params->adv_max_steps) {
-            float adv_x = state[4 + i * 2];
-            float adv_y = state[4 + i * 2 + 1];
+        if ((params->active_adversaries >> i) & 1) {
+            uint base = 4 + i * 4;
+            float adv_x = state[base];
+            float adv_y = state[base + 1];
+            float adv_theta = state[base + 2];
+            float adv_v = state[base + 3];
 
-            // Pure pursuit controller
-            // float lookahead = 1.0f;
-            // float k = 2.0f;
+            // Pure pursuit controller: steer towards ego agent
             float dx = state[0] - adv_x;
             float dy = state[1] - adv_y;
-            // float dist = sqrt(dx*dx + dy*dy);
-            float theta = atan2(dy, dx);
-            // float error = theta - state[2];
-            // float omega = k * error;
-            float v = params->adv_v_max;
+            float target_theta = atan2(dy, dx);
             
-            state[4 + i * 2] += v * cos(theta) * dt;
-            state[4 + i * 2 + 1] += v * sin(theta) * dt;
-            state[4 + i * 2 + 2] += 1; // increment step counter
+            // Normalize angle error to [-pi, pi]
+            float error = target_theta - adv_theta;
+            while (error >  3.1415926535f) error -= 2.0f * 3.1415926535f;
+            while (error < -3.1415926535f) error += 2.0f * 3.1415926535f;
+            
+            float k = 2.0f; // steering gain
+            float adv_omega = k * error;
+            
+            // Non-holonomic dynamics
+            state[base]     += adv_v * cos(adv_theta) * dt;
+            state[base + 1] += adv_v * sin(adv_theta) * dt;
+            state[base + 2] += adv_omega * dt;
+            // state[base + 3] (velocity) remains constant
         }
     }
 
@@ -94,6 +101,8 @@ float mppi_stage_cost(
     device const uint8_t* model_params_raw,
     device const uint8_t* cost_params_raw
 ) {
+
+    device const ModelParams* model_params = (device const ModelParams*)model_params_raw;
     device const CostParams* params = (device const CostParams*)cost_params_raw;
     
     float dx = state[0] - params->x_goal;
@@ -107,10 +116,11 @@ float mppi_stage_cost(
     // This depends on desired behavior. We'll stick to positional cost.
 
     // Adversary collision cost
-    for (int i = 0; i < params->num_adversaries; ++i) {
-        if ((params->active_adversaries >> i) & 1 && state[4 + i * 2 + 2] < params->adv_max_steps) {
-            float adv_x = state[4 + i * 2];
-            float adv_y = state[4 + i * 2 + 1];
+    for (int i = 0; i < model_params->num_adversaries; ++i) {
+        if ((model_params->active_adversaries >> i) & 1) {
+            uint base = 4 + i * 4;
+            float adv_x = state[base];
+            float adv_y = state[base + 1];
             float dx = state[0] - adv_x;
             float dy = state[1] - adv_y;
             float dist2 = dx*dx + dy*dy;

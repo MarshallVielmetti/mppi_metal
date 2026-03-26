@@ -12,6 +12,7 @@ using namespace metal;
 float mppi_default_stage_cost(
     thread const float* state,
     thread const float* control,
+    device const uint8_t* model_params,
     device const uint8_t* cost_params
 ) {
     return 0.0f;
@@ -20,6 +21,7 @@ float mppi_default_stage_cost(
 [[visible]]
 float mppi_default_terminal_cost(
     thread const float* state,
+    device const uint8_t* model_params,
     device const uint8_t* cost_params
 ) {
     return 0.0f;

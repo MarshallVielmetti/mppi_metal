@@ -23,6 +23,17 @@ void mppi_dynamics(
 float mppi_stage_cost(
     thread const float* state,
     thread const float* control,
+    device const uint8_t* model_params,
+    device const uint8_t* cost_params
+) {
+    return state[0] * state[0] + state[1] * state[1];
+}
+
+// Terminal cost: also penalize distance.
+[[visible]]
+float mppi_terminal_cost(
+    thread const float* state,
+    device const uint8_t* model_params,
     device const uint8_t* cost_params
 ) {
     return state[0] * state[0] + state[1] * state[1];
