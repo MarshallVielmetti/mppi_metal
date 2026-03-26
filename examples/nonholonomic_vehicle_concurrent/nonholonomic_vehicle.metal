@@ -55,6 +55,7 @@ void mppi_dynamics(
 float mppi_stage_cost(
     thread const float* state,
     thread const float* control,
+    device const uint8_t* model_params_raw,
     device const uint8_t* cost_params_raw
 ) {
     device const CostParams* params = (device const CostParams*)cost_params_raw;
@@ -75,6 +76,7 @@ float mppi_stage_cost(
 [[visible]]
 float mppi_terminal_cost(
     thread const float* state,
+    device const uint8_t* model_params_raw,
     device const uint8_t* cost_params_raw
 ) {
     device const CostParams* params = (device const CostParams*)cost_params_raw;

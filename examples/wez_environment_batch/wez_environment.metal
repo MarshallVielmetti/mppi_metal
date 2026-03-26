@@ -6,6 +6,12 @@ using namespace metal;
 struct ModelParams {
     float v_max;
     float dt;
+
+    // Adversary parameters
+    float adv_v_max;
+    int adv_max_steps;
+    int num_adversaries;    // number of adversaries < 32
+    int active_adversaries; // bitmask of active adversaries
 };
 
 struct CostParams {
@@ -15,10 +21,16 @@ struct CostParams {
     float pos_weight;
     float heading_weight;
     float control_weight;
+
+    // Adversary parameters
+    float collision_radius;
+    float adv_collision_weight;
+    float adv_dist_weight;
 };
 
-// Dynamics: Kinematic Bicycle Model / Non-holonomic vehicle
-// State: [x, y, theta, v]
+// Ego Dynamics: Kinematic Bicycle Model / Non-holonomic vehicle
+// Adversary Dynamics: Pure-pursuit, constant velocity
+// State: [x, y, theta, v, x_adv_1, y_adv_1, c_adv_1, x_adv_2, y_adv_2, c_adv_2...]
 // Control: [a, omega]
 [[visible]]
 void mppi_dynamics(
@@ -39,6 +51,30 @@ void mppi_dynamics(
     state[1] += v * sin(theta) * dt;
     state[2] += omega * dt;
     state[3] += a * dt;
+
+    // Update adversaries
+    for (int i = 0; i < params->num_adversaries; ++i) {
+        if ((params->active_adversaries >> i) & 1 && state[4 + i * 2 + 2] < params->adv_max_steps) {
+            float adv_x = state[4 + i * 2];
+            float adv_y = state[4 + i * 2 + 1];
+
+            // Pure pursuit controller
+            // float lookahead = 1.0f;
+            // float k = 2.0f;
+            float dx = state[0] - adv_x;
+            float dy = state[1] - adv_y;
+            // float dist = sqrt(dx*dx + dy*dy);
+            float theta = atan2(dy, dx);
+            // float error = theta - state[2];
+            // float omega = k * error;
+            float v = params->adv_v_max;
+            
+            state[4 + i * 2] += v * cos(theta) * dt;
+            state[4 + i * 2 + 1] += v * sin(theta) * dt;
+            state[4 + i * 2 + 2] += 1; // increment step counter
+        }
+    }
+
     
     // Wrap theta to [-pi, pi]
     float pi = 3.1415926535f;
@@ -69,6 +105,19 @@ float mppi_stage_cost(
     
     // Optional: add a small penalty on velocity to encourage stopping at goal?
     // This depends on desired behavior. We'll stick to positional cost.
+
+    // Adversary collision cost
+    for (int i = 0; i < params->num_adversaries; ++i) {
+        if ((params->active_adversaries >> i) & 1 && state[4 + i * 2 + 2] < params->adv_max_steps) {
+            float adv_x = state[4 + i * 2];
+            float adv_y = state[4 + i * 2 + 1];
+            float dx = state[0] - adv_x;
+            float dy = state[1] - adv_y;
+            float dist2 = dx*dx + dy*dy;
+            cost += params->adv_collision_weight * exp(-dist2 / (params->collision_radius * params->collision_radius));
+        }
+    }
+
     
     return cost;
 }

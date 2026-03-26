@@ -84,10 +84,10 @@ void mppi_rollout(
         }
 
         dynamics_table[0](state, control, model_params);
-        total_cost += stage_cost_table[0](state, control, cost_params);
+        total_cost += stage_cost_table[0](state, control, model_params, cost_params);
     }
 
-    total_cost += terminal_cost_table[0](state, cost_params);
+    total_cost += terminal_cost_table[0](state, model_params, cost_params);
     costs_out[gid] = total_cost;
 }
 
@@ -156,9 +156,9 @@ void mppi_rollout_batch(
         }
 
         dynamics_table[0](state, control, model_params);
-        total_cost += stage_cost_table[0](state, control, cost_params);
+        total_cost += stage_cost_table[0](state, control, model_params, cost_params);
     }
 
-    total_cost += terminal_cost_table[0](state, cost_params);
+    total_cost += terminal_cost_table[0](state, model_params, cost_params);
     costs_out[agent_idx * sample_count + sample_idx] = total_cost;
 }

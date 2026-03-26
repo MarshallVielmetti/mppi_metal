@@ -15,10 +15,12 @@ using MppiDynamicsFn = void(thread float* state,
 /// Per-timestep running cost (must not mutate state).
 using MppiStageCostFn = float(thread const float* state,
                               thread const float* control,
+                              device const uint8_t* model_params,
                               device const uint8_t* cost_params);
 
 /// Terminal cost at end of horizon (must not mutate state).
 using MppiTerminalCostFn = float(thread const float* state,
+                                 device const uint8_t* model_params,
                                  device const uint8_t* cost_params);
 
 // ---------------------------------------------------------------------------

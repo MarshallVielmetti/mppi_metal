@@ -28,8 +28,8 @@ int main() {
     mppi_metal::DriverConfig config;
     config.state_dim = 4;
     config.control_dim = 2;
-    config.horizon = 20;
-    config.sample_count = 256;
+    config.horizon = 80;
+    config.sample_count = 1024;
     config.lambda = 1.0f;
 
     // Control Noise: [acceleration, omega]
