@@ -160,4 +160,15 @@ struct StepDiagnostics {
 	bool converged = false;
 };
 
+// ---------------------------------------------------------------------------
+// Multi-step simulation outputs
+// ---------------------------------------------------------------------------
+
+struct SimulationResults {
+	float* states_out = nullptr;     // (num_steps) * state_dim
+	float* controls_out = nullptr;   // (num_steps) * control_dim (the optimal control chosen at each step)
+	float* costs_out = nullptr;      // (num_steps) elements (best_cost at each step)
+	uint32_t num_steps = 0;
+};
+
 }  // namespace mppi_metal

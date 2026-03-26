@@ -63,6 +63,17 @@ public:
 	/// Fails if the shape does not match DriverConfig exactly.
 	bool reset(const ControlSequenceView& u_nominal, std::string* error = nullptr);
 
+	/// Run a continuous multi-step MPPI simulation on the GPU.
+	/// Encodes the entire sequence of steps into a single command buffer,
+	/// automatically propagating the "true" state using the optimal control
+	/// and automatically handling the warm-start shift.
+	bool simulate(
+		uint32_t num_steps,
+		const StepInputs& initial_inputs,
+		const SimulationResults& results,
+		std::string* error = nullptr
+	);
+
 private:
 	class Impl;
 	std::unique_ptr<Impl> impl_;

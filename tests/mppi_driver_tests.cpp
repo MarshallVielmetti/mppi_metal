@@ -5,6 +5,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cmath>
 
 #ifndef TEST_USER_METALLIB_PATH
 #define TEST_USER_METALLIB_PATH ""
@@ -690,6 +691,71 @@ void test_step_rng_determinism() {
 		"Same seed should produce identical outputs (Philox determinism)");
 }
 
+void test_simulate_multi_step_parity() {
+	auto driver1 = make_initialized_driver({}, "mppi_stage_cost");
+	auto driver2 = make_initialized_driver({}, "mppi_stage_cost");
+
+	const uint32_t N = 5;
+	const uint32_t H = 10, C = 2, Sdim = 4;
+	
+	std::vector<float> x0_loop = {1.0f, 1.0f, 0.0f, 0.0f};
+	std::vector<float> x0_sim = {1.0f, 1.0f, 0.0f, 0.0f};
+	
+	std::vector<float> history_states_loop(N * Sdim);
+	std::vector<float> history_controls_loop(N * C);
+	std::vector<float> history_costs_loop(N);
+
+	std::vector<float> u_out(H * C, 0.0f);
+	mppi_metal::MutableControlSequenceView out_view = {u_out.data(), H, C};
+
+	for (uint32_t i = 0; i < N; ++i) {
+		mppi_metal::StepInputs inputs;
+		inputs.x0 = {x0_loop.data(), Sdim};
+		mppi_metal::StepDiagnostics diag;
+		
+		driver1.step(inputs, out_view, &diag, nullptr);
+
+		for (uint32_t d=0; d<Sdim; ++d) history_states_loop[i * Sdim + d] = x0_loop[d];
+		for (uint32_t d=0; d<C; ++d) history_controls_loop[i * C + d] = u_out[d];
+		history_costs_loop[i] = diag.best_cost;
+
+		float dt = 0.1f;
+		x0_loop[0] += x0_loop[2] * dt;
+		x0_loop[1] += x0_loop[3] * dt;
+		x0_loop[2] += u_out[0] * dt;
+		x0_loop[3] += u_out[1] * dt;
+	}
+
+	std::vector<float> history_states_sim(N * Sdim);
+	std::vector<float> history_controls_sim(N * C);
+	std::vector<float> history_costs_sim(N);
+
+	mppi_metal::SimulationResults results;
+	results.states_out = history_states_sim.data();
+	results.controls_out = history_controls_sim.data();
+	results.costs_out = history_costs_sim.data();
+	results.num_steps = N;
+
+	mppi_metal::StepInputs sim_inputs;
+	sim_inputs.x0 = {x0_sim.data(), Sdim};
+	std::string error;
+	bool ok = driver2.simulate(N, sim_inputs, results, &error);
+	expect_true(ok, "simulate() should succeed: " + error);
+
+	bool match = true;
+	for (uint32_t i = 0; i < N; ++i) {
+		for (uint32_t d=0; d<Sdim; ++d) {
+			if (std::abs(history_states_loop[i*Sdim + d] - history_states_sim[i*Sdim + d]) > 1e-4f) match = false;
+		}
+		for (uint32_t d=0; d<C; ++d) {
+			if (std::abs(history_controls_loop[i*C + d] - history_controls_sim[i*C + d]) > 1e-4f) match = false;
+		}
+		if (std::abs(history_costs_loop[i] - history_costs_sim[i]) > 1e-4f) match = false;
+	}
+	
+	expect_true(match, "Multi-step simulate() should exactly match N iterations of step()");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -743,6 +809,7 @@ int main() {
 	test_step_override_shape_mismatch();
 	test_step_mppi_moves_toward_origin();
 	test_step_rng_determinism();
+	test_simulate_multi_step_parity();
 
 	std::cout << "\n" << g_pass << " passed, " << g_fail << " failed.\n";
 	return g_fail > 0 ? 1 : 0;

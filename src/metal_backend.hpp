@@ -67,6 +67,21 @@ public:
 		std::string* error = nullptr
 	);
 
+	/// Dispatch a multi-step continuous sequence on the GPU.
+	/// Automatically propagates state and warm-starts across iterations.
+	bool dispatch_simulation(
+		uint32_t num_steps,
+		const DriverConfig& config,
+		uint64_t start_step_index,
+		const float* x0,
+		const float* u_nominal,
+		const ControlNoiseConfig& noise,
+		const ByteView& model_params,
+		const ByteView& cost_params,
+		const SimulationResults& results,
+		std::string* error = nullptr
+	);
+
 	/// Release GPU resources and reset internal state.
 	bool reset(std::string* error = nullptr);
 

@@ -340,6 +340,86 @@ bool MPPIDriver::step(
 	return true;
 }
 
+bool MPPIDriver::simulate(
+	uint32_t num_steps,
+	const StepInputs& inputs,
+	const SimulationResults& results,
+	std::string* error
+) {
+	auto set_err = [&](const std::string& msg) {
+		if (error != nullptr) {
+			*error = msg;
+		}
+	};
+
+	if (!impl_->initialized) {
+		set_err("Driver is not initialized. Call initialize() first.");
+		return false;
+	}
+
+	if (num_steps == 0) {
+		set_err("num_steps must be > 0.");
+		return false;
+	}
+
+	const auto& cfg = impl_->config;
+
+	// Validate x0.
+	if (inputs.x0.data == nullptr) {
+		set_err("StepInputs::x0.data must not be null.");
+		return false;
+	}
+	if (inputs.x0.state_dim != cfg.state_dim) {
+		set_err("StepInputs::x0.state_dim (" +
+			std::to_string(inputs.x0.state_dim) +
+			") must match DriverConfig::state_dim (" +
+			std::to_string(cfg.state_dim) + ").");
+		return false;
+	}
+
+	if (results.num_steps != num_steps) {
+		set_err("SimulationResults::num_steps mismatch.");
+		return false;
+	}
+
+	const float* active_nominal = impl_->u_nominal.data();
+	if (inputs.u_nominal_override.data != nullptr) {
+		if (inputs.u_nominal_override.horizon != cfg.horizon ||
+			inputs.u_nominal_override.control_dim != cfg.control_dim) {
+			set_err("u_nominal_override shape mismatch.");
+			return false;
+		}
+		active_nominal = inputs.u_nominal_override.data;
+	}
+
+	ByteView active_model_params = impl_->bound_params.model_params;
+	if (inputs.model_params_override.bytes > 0) {
+		active_model_params = inputs.model_params_override;
+	}
+
+	ByteView active_cost_params = impl_->bound_params.cost_params;
+	if (inputs.cost_params_override.bytes > 0) {
+		active_cost_params = inputs.cost_params_override;
+	}
+
+	if (!impl_->backend.dispatch_simulation(
+			num_steps,
+			cfg,
+			impl_->step_index,
+			inputs.x0.data,
+			active_nominal,
+			cfg.noise,
+			active_model_params,
+			active_cost_params,
+			results,
+			error)) {
+		return false;
+	}
+
+	impl_->step_index += num_steps;
+	return true;
+}
+
 bool MPPIDriver::reset(std::string* error) {
 	// Zero out internal nominal controls and reset step index.
 	// Bound ProblemParams are kept unchanged.
