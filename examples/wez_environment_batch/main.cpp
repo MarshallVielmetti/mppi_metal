@@ -265,9 +265,9 @@ int main() {
     for (uint32_t a = 0; a < N_AGENTS; ++a) {
         int steps_taken = N_STEPS;
         for (uint32_t step = 0; step < N_STEPS; ++step) {
-            size_t s_base = a * N_STEPS * SDIM + step * SDIM;
-            size_t c_base = a * N_STEPS * CDIM + step * CDIM;
-            size_t cost_idx = a * N_STEPS + step;
+            size_t s_base = step * N_AGENTS * SDIM + a * SDIM;
+            size_t c_base = step * N_AGENTS * CDIM + a * CDIM;
+            size_t cost_idx = step * N_AGENTS + a;
 
             float x = states_out[s_base + 0];
             float y = states_out[s_base + 1];

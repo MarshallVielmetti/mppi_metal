@@ -444,7 +444,7 @@ void mppi_propagate_and_shift_batch(
         for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
             state_view[i] = current_x_packed[agent_idx * state_dim + i];
             if (history_states) {
-                history_states[agent_idx * num_steps * state_dim + step_index * state_dim + i] =
+                history_states[step_index * (num_agents * state_dim) + agent_idx * state_dim + i] =
                     current_x_packed[agent_idx * state_dim + i];
             }
         }
@@ -453,13 +453,13 @@ void mppi_propagate_and_shift_batch(
         for (uint i = 0; i < control_dim && i < MPPI_MAX_CONTROL_DIM; ++i) {
             control_copy[i] = u_opt_packed[agent_seq_base + i];
             if (history_controls) {
-                history_controls[agent_idx * num_steps * control_dim + step_index * control_dim + i] =
+                history_controls[step_index * (num_agents * control_dim) + agent_idx * control_dim + i] =
                     u_opt_packed[agent_seq_base + i];
             }
         }
 
         if (history_costs) {
-            history_costs[agent_idx * num_steps + step_index] = diagnostics[agent_idx * 3 + 0];
+            history_costs[step_index * num_agents + agent_idx] = diagnostics[agent_idx * 3 + 0];
         }
 
         // Just use agent_idx + step_index as a dummy seed for propagation
