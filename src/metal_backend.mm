@@ -120,10 +120,10 @@ struct MetalBackend::Impl {
 
     // Avoid deallocating and reallocating if num_steps changed/decreased
     // (common case).
-    bool changed = (batch_alloc_N > N) || (batch_alloc_S != S) ||
+    bool changed = (batch_alloc_N != N) || (batch_alloc_S != S) ||
                    (batch_alloc_H != H) || (batch_alloc_cdim != cdim) ||
                    (batch_alloc_sdim != sdim) ||
-                   (batch_alloc_num_steps != num_steps);
+                   (batch_alloc_num_steps > num_steps);
     if (!changed)
       return;
 
@@ -151,8 +151,8 @@ struct MetalBackend::Impl {
     batch_his_cost_buf = [dev newBufferWithLength:N * num_steps * sizeof(float)
                                           options:MTLResourceStorageModeShared];
     batch_terminal_state_buf =
-      [dev newBufferWithLength:N * sdim * sizeof(float)
-               options:MTLResourceStorageModeShared];
+        [dev newBufferWithLength:N * sdim * sizeof(float)
+                         options:MTLResourceStorageModeShared];
 
     batch_alloc_N = N;
     batch_alloc_S = S;
@@ -1067,14 +1067,14 @@ bool MetalBackend::dispatch_batch_simulation(
     [enc setBuffer:impl_->batch_u_nom_buf offset:0 atIndex:1];
     [enc setBuffer:impl_->batch_u_out_buf offset:0 atIndex:2];
     [enc setBuffer:(need_state_history ? impl_->batch_his_state_buf : nil)
-       offset:0
-      atIndex:3];
+            offset:0
+           atIndex:3];
     [enc setBuffer:(need_control_history ? impl_->batch_his_ctrl_buf : nil)
-       offset:0
-      atIndex:4];
+            offset:0
+           atIndex:4];
     [enc setBuffer:(need_cost_history ? impl_->batch_his_cost_buf : nil)
-       offset:0
-      atIndex:5];
+            offset:0
+           atIndex:5];
     [enc setBuffer:impl_->batch_diag_buf offset:0 atIndex:6];
     [enc setBuffer:mp_buf offset:0 atIndex:7];
     [enc setBytes:&sdim length:sizeof(uint32_t) atIndex:8];
@@ -1085,10 +1085,10 @@ bool MetalBackend::dispatch_batch_simulation(
                    atBufferIndex:12];
     [enc setBytes:&N length:sizeof(uint32_t) atIndex:13];
     [enc setBytes:&num_steps length:sizeof(uint32_t) atIndex:14];
-    [enc setBuffer:(need_terminal_states ? impl_->batch_terminal_state_buf
-                       : nil)
-       offset:0
-      atIndex:15];
+    [enc
+        setBuffer:(need_terminal_states ? impl_->batch_terminal_state_buf : nil)
+           offset:0
+          atIndex:15];
     [enc dispatchThreads:MTLSizeMake(seq_len, N, 1)
         threadsPerThreadgroup:MTLSizeMake(propagate_tpg, 1, 1)];
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
