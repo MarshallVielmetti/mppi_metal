@@ -331,7 +331,7 @@ struct BatchSimulationResults {
 	float* states_out = nullptr;     // [num_agents * num_steps * state_dim]
 	float* controls_out = nullptr;   // [num_agents * num_steps * control_dim]
 	float* costs_out = nullptr;      // [num_agents * num_steps]
-	float* terminal_states_out = nullptr;  // [num_agents * state_dim], final step only
+	float* terminal_states_out = nullptr;  // [num_agents * state_dim]
 	uint32_t num_agents = 0;
 	uint32_t num_steps = 0;
 };
@@ -348,8 +348,8 @@ bool simulate_batch(
 **Memory layout**: All buffers are contiguous and indexed as
 `[step * num_agents * dim + agent_idx * dim + element]`.
 
-For `terminal_states_out`, the library copies only the final simulated state
-for each agent (step index `num_steps - 1`) into a packed
+For `terminal_states_out`, the library copies only the final post-propagation
+state for each agent (after dynamics for the last simulated step) into a packed
 `[num_agents * state_dim]` buffer using `[agent_idx * state_dim + element]`
 indexing. If `num_steps == 0`, no terminal-state copy is performed.
 

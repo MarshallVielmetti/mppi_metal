@@ -427,6 +427,7 @@ void mppi_propagate_and_shift_batch(
     visible_function_table<MppiDynamicsFn> dynamics_table [[buffer(12)]],
     constant uint&        num_agents          [[buffer(13)]],
     constant uint&        num_steps           [[buffer(14)]],
+    device float*         terminal_states     [[buffer(15)]],   // [N * sdim]
     uint2 gid [[thread_position_in_grid]]
 ) {
     uint flat_idx  = gid.x;
@@ -468,6 +469,9 @@ void mppi_propagate_and_shift_batch(
 
         for (uint i = 0; i < state_dim && i < (MPPI_MAX_STATE_BYTES / 4); ++i) {
             current_x_packed[agent_idx * state_dim + i] = state_view[i];
+            if (terminal_states) {
+                terminal_states[agent_idx * state_dim + i] = state_view[i];
+            }
         }
     }
 

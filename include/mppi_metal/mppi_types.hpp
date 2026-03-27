@@ -182,7 +182,7 @@ struct BatchSimulationResults {
 	float* states_out = nullptr;     // [num_agents * num_steps * state_dim]
 	float* controls_out = nullptr;   // [num_agents * num_steps * control_dim]
 	float* costs_out = nullptr;      // [num_agents * num_steps]
-	float *terminal_states_out = nullptr; // [num_agents * state_dim]
+	float *terminal_states_out = nullptr; // [num_agents * state_dim], post-propagation terminal state
 	uint32_t num_agents = 0;
 	uint32_t num_steps = 0;
 };

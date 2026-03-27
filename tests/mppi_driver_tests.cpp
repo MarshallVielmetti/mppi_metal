@@ -863,6 +863,180 @@ void test_simulate_batch_multi_agent() {
 	expect_true(valid_costs, "All batch costs should be > 0");
 }
 
+void test_simulate_batch_terminal_states_match_post_propagation_state() {
+	// Terminal states are defined as post-propagation states after the final step.
+	// Verify this by comparing against the next pre-propagation state from a T+1 run.
+	auto driver_terminal = make_initialized_driver({}, "mppi_stage_cost");
+	auto driver_extended = make_initialized_driver({}, "mppi_stage_cost");
+
+	const uint32_t N = 3;
+	const uint32_t T = 6;
+	const uint32_t Sdim = 4;
+
+	std::vector<float> x0_packed = {
+		1.0f,  1.0f, 0.0f, 0.0f,
+		-1.5f, 0.5f, 0.0f, 0.0f,
+		0.5f, -1.0f, 0.0f, 0.0f,
+	};
+
+	std::vector<float> terminal_states(N * Sdim, 0.0f);
+
+	mppi_metal::BatchSimulationResults terminal_results;
+	terminal_results.terminal_states_out = terminal_states.data();
+	terminal_results.num_agents = N;
+	terminal_results.num_steps = T;
+
+	std::string err;
+	bool ok = driver_terminal.simulate_batch(
+		N, T, x0_packed.data(), terminal_results, &err);
+	expect_true(ok,
+		"simulate_batch with terminal_states_out should succeed: " + err);
+
+	std::vector<float> states_extended(N * (T + 1) * Sdim, 0.0f);
+	mppi_metal::BatchSimulationResults extended_results;
+	extended_results.states_out = states_extended.data();
+	extended_results.num_agents = N;
+	extended_results.num_steps = T + 1;
+
+	ok = driver_extended.simulate_batch(N, T + 1, x0_packed.data(), extended_results, &err);
+	expect_true(ok,
+		"simulate_batch(T+1) for terminal-state reference should succeed: " + err);
+
+	bool match = true;
+	const size_t reference_base = static_cast<size_t>(T) * N * Sdim;
+	for (uint32_t a = 0; a < N; ++a) {
+		for (uint32_t d = 0; d < Sdim; ++d) {
+			const float expected = states_extended[reference_base + a * Sdim + d];
+			const float got = terminal_states[a * Sdim + d];
+			if (std::abs(expected - got) > 1e-4f) {
+				match = false;
+				break;
+			}
+		}
+		if (!match) break;
+	}
+	expect_true(match,
+		"terminal_states_out should match post-propagation state after final step");
+}
+
+void test_simulate_batch_terminal_only_matches_reference() {
+	// Terminal-only mode should produce the same final states as a full-history run.
+	auto driver_ref = make_initialized_driver({}, "mppi_stage_cost");
+	auto driver_terminal_only = make_initialized_driver({}, "mppi_stage_cost");
+
+	const uint32_t N = 4;
+	const uint32_t T = 5;
+	const uint32_t Sdim = 4;
+
+	std::vector<float> x0_packed = {
+		1.0f,  1.0f, 0.0f, 0.0f,
+		-1.0f, 1.0f, 0.0f, 0.0f,
+		1.0f, -1.0f, 0.0f, 0.0f,
+		-1.0f,-1.0f, 0.0f, 0.0f,
+	};
+
+	std::vector<float> states_ref(N * T * Sdim, 0.0f);
+	std::vector<float> terminal_ref(N * Sdim, 0.0f);
+	mppi_metal::BatchSimulationResults ref_results;
+	ref_results.states_out = states_ref.data();
+	ref_results.terminal_states_out = terminal_ref.data();
+	ref_results.num_agents = N;
+	ref_results.num_steps = T;
+
+	std::string err;
+	bool ok = driver_ref.simulate_batch(N, T, x0_packed.data(), ref_results, &err);
+	expect_true(ok, "reference simulate_batch should succeed: " + err);
+
+	std::vector<float> terminal_only(N * Sdim, 0.0f);
+	mppi_metal::BatchSimulationResults terminal_only_results;
+	terminal_only_results.terminal_states_out = terminal_only.data();
+	terminal_only_results.num_agents = N;
+	terminal_only_results.num_steps = T;
+
+	ok = driver_terminal_only.simulate_batch(
+		N, T, x0_packed.data(), terminal_only_results, &err);
+	expect_true(ok,
+		"simulate_batch with terminal_states_out only should succeed: " + err);
+
+	bool match = true;
+	for (uint32_t i = 0; i < N * Sdim; ++i) {
+		if (std::abs(terminal_ref[i] - terminal_only[i]) > 1e-4f) {
+			match = false;
+			break;
+		}
+	}
+	expect_true(match,
+		"terminal-only output should match reference full-output terminal states");
+}
+
+void test_simulate_batch_all_optional_outputs_null_succeeds() {
+	// All output pointers are optional; simulation should still execute.
+	auto driver = make_initialized_driver({}, "mppi_stage_cost");
+
+	const uint32_t N = 2;
+	const uint32_t T = 4;
+
+	std::vector<float> x0_packed = {
+		1.0f, 0.0f, 0.0f, 0.0f,
+		-1.0f, 0.0f, 0.0f, 0.0f,
+	};
+
+	mppi_metal::BatchSimulationResults results;
+	results.num_agents = N;
+	results.num_steps = T;
+
+	std::string err;
+	bool ok = driver.simulate_batch(N, T, x0_packed.data(), results, &err);
+	expect_true(ok,
+		"simulate_batch should succeed with all optional outputs set to null: " + err);
+}
+
+void test_simulate_batch_controls_and_costs_only() {
+	// Request only controls/costs and ensure they are populated with valid values.
+	auto driver = make_initialized_driver({}, "mppi_stage_cost");
+
+	const uint32_t N = 3;
+	const uint32_t T = 5;
+	const uint32_t C = 2;
+
+	std::vector<float> x0_packed = {
+		1.0f,  1.0f, 0.0f, 0.0f,
+		-1.0f, 1.0f, 0.0f, 0.0f,
+		0.0f, -1.0f, 0.0f, 0.0f,
+	};
+
+	std::vector<float> controls(N * T * C, 0.0f);
+	std::vector<float> costs(N * T, 0.0f);
+	mppi_metal::BatchSimulationResults results;
+	results.controls_out = controls.data();
+	results.costs_out = costs.data();
+	results.num_agents = N;
+	results.num_steps = T;
+
+	std::string err;
+	bool ok = driver.simulate_batch(N, T, x0_packed.data(), results, &err);
+	expect_true(ok,
+		"simulate_batch with controls_out + costs_out only should succeed: " + err);
+
+	bool valid_controls = true;
+	for (float u : controls) {
+		if (u < -1.0001f || u > 1.0001f) {
+			valid_controls = false;
+			break;
+		}
+	}
+	expect_true(valid_controls, "controls_out should respect configured bounds [-1, 1]");
+
+	bool valid_costs = true;
+	for (float c : costs) {
+		if (!(c > 0.0f)) {
+			valid_costs = false;
+			break;
+		}
+	}
+	expect_true(valid_costs, "costs_out should contain positive costs");
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -919,6 +1093,10 @@ int main() {
 	test_simulate_multi_step_parity();
 	test_simulate_batch_parity();
 	test_simulate_batch_multi_agent();
+	test_simulate_batch_terminal_states_match_post_propagation_state();
+	test_simulate_batch_terminal_only_matches_reference();
+	test_simulate_batch_all_optional_outputs_null_succeeds();
+	test_simulate_batch_controls_and_costs_only();
 
 	std::cout << "\n" << g_pass << " passed, " << g_fail << " failed.\n";
 	return g_fail > 0 ? 1 : 0;

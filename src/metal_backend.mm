@@ -97,6 +97,7 @@ struct MetalBackend::Impl {
   id<MTLBuffer> batch_his_state_buf = nil;
   id<MTLBuffer> batch_his_ctrl_buf = nil;
   id<MTLBuffer> batch_his_cost_buf = nil;
+  id<MTLBuffer> batch_terminal_state_buf = nil;
   uint32_t batch_alloc_N = 0;
   uint32_t batch_alloc_S = 0;
   uint32_t batch_alloc_H = 0;
@@ -149,6 +150,9 @@ struct MetalBackend::Impl {
                          options:MTLResourceStorageModeShared];
     batch_his_cost_buf = [dev newBufferWithLength:N * num_steps * sizeof(float)
                                           options:MTLResourceStorageModeShared];
+    batch_terminal_state_buf =
+      [dev newBufferWithLength:N * sdim * sizeof(float)
+               options:MTLResourceStorageModeShared];
 
     batch_alloc_N = N;
     batch_alloc_S = S;
@@ -946,6 +950,11 @@ bool MetalBackend::dispatch_batch_simulation(
   const uint32_t cdim = config.control_dim;
   const size_t seq_len = static_cast<size_t>(H) * cdim;
 
+  const bool need_state_history = (results.states_out != nullptr);
+  const bool need_control_history = (results.controls_out != nullptr);
+  const bool need_cost_history = (results.costs_out != nullptr);
+  const bool need_terminal_states = (results.terminal_states_out != nullptr);
+
   impl_->ensure_scratchpad(config, 0);
   impl_->ensure_batch_scratchpad(config, N, num_steps);
 
@@ -1057,9 +1066,15 @@ bool MetalBackend::dispatch_batch_simulation(
     [enc setBuffer:impl_->batch_x0_buf offset:0 atIndex:0];
     [enc setBuffer:impl_->batch_u_nom_buf offset:0 atIndex:1];
     [enc setBuffer:impl_->batch_u_out_buf offset:0 atIndex:2];
-    [enc setBuffer:impl_->batch_his_state_buf offset:0 atIndex:3];
-    [enc setBuffer:impl_->batch_his_ctrl_buf offset:0 atIndex:4];
-    [enc setBuffer:impl_->batch_his_cost_buf offset:0 atIndex:5];
+    [enc setBuffer:(need_state_history ? impl_->batch_his_state_buf : nil)
+       offset:0
+      atIndex:3];
+    [enc setBuffer:(need_control_history ? impl_->batch_his_ctrl_buf : nil)
+       offset:0
+      atIndex:4];
+    [enc setBuffer:(need_cost_history ? impl_->batch_his_cost_buf : nil)
+       offset:0
+      atIndex:5];
     [enc setBuffer:impl_->batch_diag_buf offset:0 atIndex:6];
     [enc setBuffer:mp_buf offset:0 atIndex:7];
     [enc setBytes:&sdim length:sizeof(uint32_t) atIndex:8];
@@ -1070,6 +1085,10 @@ bool MetalBackend::dispatch_batch_simulation(
                    atBufferIndex:12];
     [enc setBytes:&N length:sizeof(uint32_t) atIndex:13];
     [enc setBytes:&num_steps length:sizeof(uint32_t) atIndex:14];
+    [enc setBuffer:(need_terminal_states ? impl_->batch_terminal_state_buf
+                       : nil)
+       offset:0
+      atIndex:15];
     [enc dispatchThreads:MTLSizeMake(seq_len, N, 1)
         threadsPerThreadgroup:MTLSizeMake(propagate_tpg, 1, 1)];
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1096,11 +1115,8 @@ bool MetalBackend::dispatch_batch_simulation(
     std::memcpy(results.costs_out, impl_->batch_his_cost_buf.contents,
                 N * num_steps * sizeof(float));
   if (results.terminal_states_out && num_steps > 0) {
-    const float *state_hist =
-        static_cast<const float *>(impl_->batch_his_state_buf.contents);
-
     std::memcpy(results.terminal_states_out,
-                state_hist + (num_steps - 1) * sdim * N,
+                impl_->batch_terminal_state_buf.contents,
                 N * sdim * sizeof(float));
   }
 
