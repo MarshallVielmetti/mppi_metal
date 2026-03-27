@@ -117,7 +117,9 @@ struct MetalBackend::Impl {
     const uint32_t sdim = config.state_dim;
     const uint32_t N = num_agents;
 
-    bool changed = (batch_alloc_N != N) || (batch_alloc_S != S) ||
+    // Avoid deallocating and reallocating if num_steps changed/decreased
+    // (common case).
+    bool changed = (batch_alloc_N > N) || (batch_alloc_S != S) ||
                    (batch_alloc_H != H) || (batch_alloc_cdim != cdim) ||
                    (batch_alloc_sdim != sdim) ||
                    (batch_alloc_num_steps != num_steps);
