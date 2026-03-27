@@ -345,7 +345,7 @@ bool simulate_batch(
 ```
 
 **Memory layout**: All buffers are contiguous and indexed as
-`[agent_idx * num_steps * dim + step * dim + element]`.
+`[step * num_agents * dim + agent_idx * dim + element]`.
 
 **RNG independence**: Each agent derives its Philox key as `base_seed + agent_idx`.
 Agent 0 produces identical noise to the single-agent `simulate()` path, preserving

@@ -177,7 +177,7 @@ struct SimulationResults {
 
 /// Results buffer for simulate_batch().
 /// All output arrays are contiguous and indexed as:
-///   [agent_idx * num_steps * dim + step * dim + element]
+///   [step * num_agents * dim + agent_idx * dim + element]
 struct BatchSimulationResults {
 	float* states_out = nullptr;     // [num_agents * num_steps * state_dim]
 	float* controls_out = nullptr;   // [num_agents * num_steps * control_dim]
