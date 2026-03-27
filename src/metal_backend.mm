@@ -123,7 +123,7 @@ struct MetalBackend::Impl {
     bool changed = (batch_alloc_N != N) || (batch_alloc_S != S) ||
                    (batch_alloc_H != H) || (batch_alloc_cdim != cdim) ||
                    (batch_alloc_sdim != sdim) ||
-                   (batch_alloc_num_steps > num_steps);
+                   (num_steps > batch_alloc_num_steps);
     if (!changed)
       return;
 
