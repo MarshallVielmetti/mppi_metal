@@ -306,9 +306,9 @@ After a successful `step(...)`, the internal nominal sequence is advanced as:
 ### Error and validation policy (locked)
 
 - For `reset(const ControlSequenceView&, ...)`, shape must match exactly:
-	- `u_nominal.horizon == DriverConfig::horizon`
-	- `u_nominal.control_dim == DriverConfig::control_dim`
-	- `u_nominal.data != nullptr` when `horizon * control_dim > 0`
+  - `u_nominal.horizon == DriverConfig::horizon`
+  - `u_nominal.control_dim == DriverConfig::control_dim`
+  - `u_nominal.data != nullptr` when `horizon * control_dim > 0`
 - Any mismatch is a hard fail and returns `false`.
 - `std::string* error` may be `nullptr`. In that case, methods still return `false` on failure but do not write an error message.
 - v1 keeps `bool + std::string*` for C++17 compatibility; a future C++23 profile may provide `std::expected` overloads.
@@ -331,6 +331,7 @@ struct BatchSimulationResults {
 	float* states_out = nullptr;     // [num_agents * num_steps * state_dim]
 	float* controls_out = nullptr;   // [num_agents * num_steps * control_dim]
 	float* costs_out = nullptr;      // [num_agents * num_steps]
+	float* terminal_states_out = nullptr;  // [num_agents * state_dim], final step only
 	uint32_t num_agents = 0;
 	uint32_t num_steps = 0;
 };
@@ -347,11 +348,17 @@ bool simulate_batch(
 **Memory layout**: All buffers are contiguous and indexed as
 `[step * num_agents * dim + agent_idx * dim + element]`.
 
+For `terminal_states_out`, the library copies only the final simulated state
+for each agent (step index `num_steps - 1`) into a packed
+`[num_agents * state_dim]` buffer using `[agent_idx * state_dim + element]`
+indexing. If `num_steps == 0`, no terminal-state copy is performed.
+
 **RNG independence**: Each agent derives its Philox key as `base_seed + agent_idx`.
 Agent 0 produces identical noise to the single-agent `simulate()` path, preserving
 backward compatibility for N=1.
 
 **GPU dispatch**: The batch kernels use 2D grid dispatches:
+
 - Rollout: `(sample_count, num_agents)` threads.
 - Weights: `num_agents` threadgroups (one per agent).
 - Reduce / Propagate: `(horizon * control_dim, num_agents)` threads.

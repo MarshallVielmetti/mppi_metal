@@ -121,7 +121,8 @@ struct MetalBackend::Impl {
                    (batch_alloc_H != H) || (batch_alloc_cdim != cdim) ||
                    (batch_alloc_sdim != sdim) ||
                    (batch_alloc_num_steps != num_steps);
-    if (!changed) return;
+    if (!changed)
+      return;
 
     id<MTLDevice> dev = device;
     const size_t seq_len = static_cast<size_t>(H) * cdim;
@@ -138,10 +139,12 @@ struct MetalBackend::Impl {
                                        options:MTLResourceStorageModeShared];
     batch_diag_buf = [dev newBufferWithLength:N * 3 * sizeof(float)
                                       options:MTLResourceStorageModeShared];
-    batch_his_state_buf = [dev newBufferWithLength:N * num_steps * sdim * sizeof(float)
-                                           options:MTLResourceStorageModeShared];
-    batch_his_ctrl_buf = [dev newBufferWithLength:N * num_steps * cdim * sizeof(float)
-                                          options:MTLResourceStorageModeShared];
+    batch_his_state_buf =
+        [dev newBufferWithLength:N * num_steps * sdim * sizeof(float)
+                         options:MTLResourceStorageModeShared];
+    batch_his_ctrl_buf =
+        [dev newBufferWithLength:N * num_steps * cdim * sizeof(float)
+                         options:MTLResourceStorageModeShared];
     batch_his_cost_buf = [dev newBufferWithLength:N * num_steps * sizeof(float)
                                           options:MTLResourceStorageModeShared];
 
@@ -438,12 +441,12 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
   // ---- Batch kernels ----
   id<MTLFunction> rollout_batch_fn =
       [impl_->library_metallib newFunctionWithName:@"mppi_rollout_batch"];
-  id<MTLFunction> weights_batch_fn =
-      [impl_->library_metallib newFunctionWithName:@"mppi_compute_weights_batch"];
+  id<MTLFunction> weights_batch_fn = [impl_->library_metallib
+      newFunctionWithName:@"mppi_compute_weights_batch"];
   id<MTLFunction> reduce_batch_fn =
       [impl_->library_metallib newFunctionWithName:@"mppi_reduce_batch"];
-  id<MTLFunction> propagate_batch_fn =
-      [impl_->library_metallib newFunctionWithName:@"mppi_propagate_and_shift_batch"];
+  id<MTLFunction> propagate_batch_fn = [impl_->library_metallib
+      newFunctionWithName:@"mppi_propagate_and_shift_batch"];
 
   if (!rollout_batch_fn || !weights_batch_fn || !reduce_batch_fn ||
       !propagate_batch_fn) {
@@ -506,12 +509,13 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
   }
 
   // Batch visible function tables for rollout
-  auto make_batch_rollout_table = [&](id<MTLFunction> fn) -> id<MTLVisibleFunctionTable> {
+  auto make_batch_rollout_table =
+      [&](id<MTLFunction> fn) -> id<MTLVisibleFunctionTable> {
     MTLVisibleFunctionTableDescriptor *td =
         [[MTLVisibleFunctionTableDescriptor alloc] init];
     td.functionCount = 1;
-    id<MTLVisibleFunctionTable> table =
-        [impl_->rollout_batch_pipeline newVisibleFunctionTableWithDescriptor:td];
+    id<MTLVisibleFunctionTable> table = [impl_->rollout_batch_pipeline
+        newVisibleFunctionTableWithDescriptor:td];
     if (table != nil) {
       id<MTLFunctionHandle> handle =
           [impl_->rollout_batch_pipeline functionHandleWithFunction:fn];
@@ -535,11 +539,11 @@ bool MetalBackend::initialize(const ModelPluginSpec &model,
   MTLVisibleFunctionTableDescriptor *td_batch_prop =
       [[MTLVisibleFunctionTableDescriptor alloc] init];
   td_batch_prop.functionCount = 1;
-  impl_->batch_propagate_dynamics_table =
-      [impl_->propagate_batch_pipeline newVisibleFunctionTableWithDescriptor:td_batch_prop];
+  impl_->batch_propagate_dynamics_table = [impl_->propagate_batch_pipeline
+      newVisibleFunctionTableWithDescriptor:td_batch_prop];
   if (impl_->batch_propagate_dynamics_table != nil) {
-    id<MTLFunctionHandle> handle =
-        [impl_->propagate_batch_pipeline functionHandleWithFunction:dynamics_fn];
+    id<MTLFunctionHandle> handle = [impl_->propagate_batch_pipeline
+        functionHandleWithFunction:dynamics_fn];
     if (handle != nil)
       [impl_->batch_propagate_dynamics_table setFunction:handle atIndex:0];
   }
@@ -1089,6 +1093,14 @@ bool MetalBackend::dispatch_batch_simulation(
   if (results.costs_out)
     std::memcpy(results.costs_out, impl_->batch_his_cost_buf.contents,
                 N * num_steps * sizeof(float));
+  if (results.terminal_states_out && num_steps > 0) {
+    const float *state_hist =
+        static_cast<const float *>(impl_->batch_his_state_buf.contents);
+
+    std::memcpy(results.terminal_states_out,
+                state_hist + (num_steps - 1) * sdim * N,
+                N * sdim * sizeof(float));
+  }
 
   return true;
 }
